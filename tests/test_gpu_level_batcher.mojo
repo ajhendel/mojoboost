@@ -3,8 +3,18 @@
 Why this file exists
 --------------------
 `grow_policy = oblivious` on the resident plane was funded on a launch-count
-argument -- fewer command buffers per tree, landing under the measured 64-deep
-queue knee where per-launch enqueue cost goes from 6-7 microseconds to 14-17.
+argument -- fewer command buffers per tree, landing under the 64-deep queue
+knee where per-launch enqueue cost goes from 6-7 microseconds to 14-17.
+
+**THE "LANDING UNDER" HALF OF THAT IS RETIRED, 2026-08-18**
+(`docs/design/SWITCH_GRID.md` section 6 item 8). A full Metal queue blocks the
+host thread that enqueues into it rather than dropping work, and the leaf-wise
+grower this package ships as its fastest arm runs 278 to 2,303 command buffers
+a tree, measured backpressured at commit 1d77414. So 64 is where a launch gets
+dearer and is not a line an arm has to stay under. The launch-count argument
+survives as a cost argument, which is what every assertion in this file
+measures; `_QUEUE_DEPTH` below is a price point that the counts are compared
+against, not a bound they must satisfy.
 The `oblivious-device` lane computed the real census against the code as it
 stands and **the argument failed**: `GpuHistogramBuilder.enqueue_desc_child`
 builds one child per launch pair, so a depth-6 tree is 176 command buffers and
@@ -17,12 +27,13 @@ the commit that decides it. This file pins the three claims that closes:
 
 1. **The census, recomputed.** `oblivious_launch_census` now takes the child
    build's shape as a parameter instead of assuming it, so all three shapes
-   this package can be in are values of one function. The number that decides
-   the mode is whether the batched shape is under 64 at depth 6. It is -- 62 --
-   **but only with a batcher sized for a whole level.** At
+   this package can be in are values of one function. The batched shape is 62
+   at depth 6 **and only with a batcher sized for a whole level**. At
    `gpu_leaf_batching.DEFAULT_MAX_ITEMS` of 32 the last level needs two batches
-   and the tree lands exactly *on* the knee at 64, which is a precondition and
-   not a preference.
+   and the tree lands at 64. This paragraph called that "a precondition and not
+   a preference" on the strength of the knee; the sizing test still stands, on
+   the ground that the two extra command buffers buy nothing at all and one
+   parameter to `open_resident` avoids them.
 
 2. **The device-written plan.** `_pick_and_commit_kernel` writes the three
    words of an item row that a commit decides, on every execution including the
@@ -66,13 +77,20 @@ from mojotrees.gpu_leaf_batching import (
     ITEM_TILES,
     ITEM_TILE_BEGIN,
     ITEM_WORDS,
+    OBLIVIOUS_MAX_ITEMS,
 )
-from mojotrees.gpu_resident_round import oblivious_launch_census
+from mojotrees.gpu_resident_round import (
+    oblivious_launch_census,
+    oblivious_schedule_launches,
+)
 from mojotrees.gpu_tree_tables import PLAN_ITEMS
 
 # The queue is 64 command buffers deep and MAX never raises it
-# (`docs/GPU_PORTABILITY.md` 6.2). A knee, not a wall, which is why the tests
-# below distinguish "under" from "on".
+# (`docs/GPU_PORTABILITY.md` 6.2). A knee, not a wall: enqueue costs 6 to 7
+# microseconds through a stream of 64 and 14 to 17 beyond, and a full queue
+# blocks the enqueuing host thread rather than dropping anything. Retired as a
+# safety criterion 2026-08-18, so every comparison below is a comparison of
+# counts against a price point.
 comptime _QUEUE_DEPTH = 64
 
 
@@ -101,8 +119,10 @@ def test_the_shape_this_package_has_today_is_the_176_the_lane_found() raises:
     # This is the number the previous lane computed by hand and recorded in
     # prose; it is now a value the same function returns.
     assert_equal(oblivious_launch_census(6, batch_max_items=-1), 176)
-    # And it fails the criterion the mode was funded on, by a hundred and
-    # twelve rather than by two.
+    # And it misses the count the mode was funded on by a hundred and twelve
+    # rather than by two. "Fails the criterion" is how this read until
+    # 2026-08-18; there is no criterion, there are 112 extra launches at 14 to
+    # 17 microseconds each.
     assert_true(oblivious_launch_census(6, batch_max_items=-1) > _QUEUE_DEPTH)
     # It is still better than leaf-wise at the default budget, which is why
     # the mode was worth a lane and not why it was worth shipping.
@@ -112,6 +132,8 @@ def test_the_shape_this_package_has_today_is_the_176_the_lane_found() raises:
 def test_the_batched_census_clears_the_knee_and_by_how_much() raises:
     # The deliverable. A depth-6 oblivious tree, with the level's children
     # built by one device-driven batch, is 62 command buffers between waits.
+    # "Clears the knee" is a statement about a count and a price, not about
+    # safety; see the header.
     assert_equal(oblivious_launch_census(6, batch_max_items=64), 62)
     assert_true(oblivious_launch_census(6, batch_max_items=64) < _QUEUE_DEPTH)
     assert_equal(
@@ -128,9 +150,11 @@ def test_the_batched_census_clears_the_knee_and_by_how_much() raises:
 
 def test_the_default_item_bound_puts_depth_six_on_the_knee_not_under_it(
 ) raises:
-    # The finding that is a precondition rather than a preference. A depth-6
-    # tree's last level has 64 children; `DEFAULT_MAX_ITEMS` is 32; the extra
-    # batch is two launches and it is exactly the margin.
+    # A depth-6 tree's last level has 64 children; `DEFAULT_MAX_ITEMS` is 32;
+    # the extra batch is two launches. This comment called that "a precondition
+    # rather than a preference"; since 2026-08-18 the reason to size the
+    # batcher for a whole level is that those two launches buy nothing, not
+    # that 64 is a line.
     assert_equal(DEFAULT_MAX_ITEMS, 32)
     var at_default = oblivious_launch_census(
         6, batch_max_items=DEFAULT_MAX_ITEMS
@@ -165,11 +189,37 @@ def test_the_batched_shape_beats_the_per_child_one_at_every_useful_depth(
 
 
 def test_depth_seven_is_over_the_knee_even_batched() raises:
-    # The batcher does not buy a depth the reserved per-leaf scan state
-    # (`OBLIVIOUS_MAX_LEAVES`) could not serve anyway, and it should not be
-    # read as having done so.
+    # **BOTH SENTENCES THAT USED TO BE HERE ARE WRONG NOW AND THE ASSERTION IS
+    # NOT.** They read: "The batcher does not buy a depth the reserved per-leaf
+    # scan state (`OBLIVIOUS_MAX_LEAVES`) could not serve anyway, and it should
+    # not be read as having done so." `OBLIVIOUS_MAX_LEAVES` went to 256 on
+    # 2026-08-18 and serves depth 8, and passing 64 command buffers costs
+    # enqueue time rather than correctness.
+    #
+    # The census still says 71 at depth 7 and that number is still worth
+    # pinning, because `oblivious_launch_census` is the FROZEN registered
+    # prediction the round was opened on and a prediction edited after the fact
+    # is not one. What it predicts is a schedule that was never built.
     assert_true(
         oblivious_launch_census(7, batch_max_items=128) > _QUEUE_DEPTH
+    )
+    assert_equal(oblivious_launch_census(7), 71)
+    # The schedule that RUNS is the one to reason about, and at the shipped
+    # `skip_last_build` it is 63 at depth 7 and 71 at depth 8 -- the depth-7
+    # figure under the knee the census put it over. Asserted beside the frozen
+    # number rather than instead of it, so the gap between model and build
+    # stays visible.
+    assert_equal(
+        oblivious_schedule_launches(
+            7, batch_max_items=OBLIVIOUS_MAX_ITEMS, skip_last_build=True
+        ),
+        63,
+    )
+    assert_equal(
+        oblivious_schedule_launches(
+            8, batch_max_items=OBLIVIOUS_MAX_ITEMS, skip_last_build=True
+        ),
+        71,
     )
 
 

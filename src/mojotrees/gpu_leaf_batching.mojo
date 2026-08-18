@@ -194,6 +194,7 @@ from .gpu_active_rows import (
     LeafRange,
 )
 from .gpu_frontier import NO_SLOT, LeafFrontier, LeafStats, LeafWorkItem
+from .gpu_split_search import OBLIVIOUS_MAX_LEAVES
 from .gpu_histogram_specializations import (
     MAX_BINS,
     PLANES_PER_HISTOGRAM,
@@ -225,31 +226,68 @@ comptime N_PLANES = PLANES_PER_HISTOGRAM
 # costs flat; it is not a claim about where batching stops paying.
 comptime DEFAULT_MAX_ITEMS = 32
 
-comptime OBLIVIOUS_MAX_ITEMS = 64
-"""Items a batcher serving `grow_policy = oblivious` must hold, and it is a
-measured number rather than a sizing preference.
+comptime OBLIVIOUS_MAX_ITEMS = OBLIVIOUS_MAX_LEAVES
+"""Items a batcher serving `grow_policy = oblivious` must hold, which is one
+per child of the widest level the cross-leaf scan can search.
 
-A depth-6 level's last generation offers `2 ** 6 = 64` children and one batch
-covers at most `max_items` of them. At `DEFAULT_MAX_ITEMS` that level needs two
-batches, which costs two extra command buffers, and
-`gpu_resident_round.oblivious_launch_census(6, batch_max_items=32)` lands the
-tree at **exactly 64** -- on the queue-depth knee rather than under it
-(`docs/GPU_PORTABILITY.md` 6.2; the enqueue-cost ladder in
-`bench/results/session3_2026-08-16/RESULTS.md` is flat at 6-7 microseconds
-through 64 and 14-17 beyond). At 64 the same census is **62**, under by two.
+**DERIVED RATHER THAN WRITTEN DOWN, SINCE 2026-08-18, AND THAT IS THE POINT.**
+The bound on an oblivious level's width was written down in four places and a
+lane raising it moved two of them, which left a depth-8 fit passing the policy
+layer and then raising "the histogram batcher cannot hold a whole level". A
+level commit turns `L` parents into `2L` children and the batch has to hold
+every one of them, and the widest level any of this can reach is
+`gpu_split_search.OBLIVIOUS_MAX_LEAVES` by definition, because that is the
+level width the scan reserves per-leaf threadgroup state for. So the two are
+the same number by construction and are now the same symbol.
+
+**IT USED TO BE THE LITERAL 64 AND BOTH REASONS GIVEN FOR IT WERE BAD.** The
+docstring read: "A depth-6 level's last generation offers `2 ** 6 = 64`
+children ... `gpu_resident_round.oblivious_launch_census(6,
+batch_max_items=32)` lands the tree at **exactly 64** -- on the queue-depth
+knee rather than under it ... It is also exactly
+`gpu_split_search.OBLIVIOUS_MAX_LEAVES`, and the agreement is not a
+coincidence: both are `2 ** 6`, both are CatBoost's default depth, and both
+stop where the queue does."
+
+The first bad reason is the anchor. `2 ** 6` is CatBoost's default depth and
+nothing about any kernel here, so a competitor's default parameter was hardened
+into our own ceiling. The second is the queue. **The 64-deep Metal command
+queue is retired as a safety criterion, 2026-08-18**
+(`docs/design/SWITCH_GRID.md` section 6 item 8).
+`MTLCommandQueue.commandBuffer` blocks the calling host thread when the queue
+is full rather than returning nil, so a stream past 64 throttles to one in
+and one out and nothing is dropped
+(`docs/GPU_PORTABILITY.md` 6.2), and the leaf-wise device-resident grower this
+package ships as its fastest arm enqueues 8 + 9 * (num_leaves - 1) buffers a
+tree, 2,303 at 256 leaves, measured backpressured at commit 1d77414 with
+`device_wait` at 0 calls. Nothing "stops where the queue does". That the two
+constants agreed was a fact worth keeping and the reasons for it were not.
+
+**What survives, and it is a price rather than a limit.** A batcher too narrow
+for the level splits it into `ceil(children / max_items)` batches at two
+command buffers each, and the extra pair buys nothing at all: the same
+children, from the same plan, into the same slots, bit for bit. The enqueue
+ladder in `bench/results/session3_2026-08-16/RESULTS.md` is flat at 6 to 7
+microseconds through a stream of 64 and 14 to 17 beyond, so the extra buffers
+are among the dearest launches in the tree. `DEFAULT_MAX_ITEMS` is 32 and a
+depth-6 level's last generation is 64 children, so the leaf-wise plane's
+batcher is exactly one doubling too narrow for this mode; that is what
+`GpuHistogramBuilder.oblivious_level_fits` tests and
+`gpu_resident_round.OBLIVIOUS_LEVEL_HISTOGRAM` reports.
 
 **Depth 5 tops out at 32 children**, so a lane that validated only at depth 5
 would see the two arms agree and would learn nothing; that is why this constant
 exists rather than a comment asking the caller to think about it.
 
-The cost is small and is worth stating so nobody trades it away: the item table
-is `max_items * (ITEM_WORDS + SCALE_WORDS)` Int32 plus `max_items * n_features`
-for the per-item feature table, which at 64 items and 50 features is under 14
-kilobytes.
-
-It is also exactly `gpu_split_search.OBLIVIOUS_MAX_LEAVES`, and the agreement is
-not a coincidence: both are `2 ** 6`, both are CatBoost's default depth, and
-both stop where the queue does."""
+**The memory this costs at 256, which is the arithmetic behind the raise.** The
+tables sized by `max_items` are `max_items * ITEM_WORDS` Int32,
+`max_items * SCALE_WORDS` Float32 and `max_items * n_features` Int32, each
+mirrored by a host staging buffer of the same size. At 256 items and 50
+features that is 61 kilobytes on the device and 61 again on the host, against a
+slot pool of `pool_capacity * 3 * n_features * n_bins` Int32 which is 39
+megabytes at 256 slots and the same shape. Three orders of magnitude apart, so
+the item table is not what decides whether a depth-8 fit fits. The pool is, and
+`oblivious_level_fits` asks it separately."""
 
 # --- Item table layout ---------------------------------------------------
 #
@@ -418,10 +456,14 @@ def _batch_copy_back_zero_kernel(
     that entry point, so a level whose children were built by a batch would
     either read a permutation that is one partition out of date, or pay the
     copy-back in a third partition launch. The third launch is 1 per level, 6
-    per depth-6 tree, and it is exactly the margin: the tree goes from 62
-    command buffers to 68 and back over the queue's knee. So the batch pays it
-    in its own zeroing pass, in the launch it has to make anyway, and the
-    partition stays two.
+    per depth-6 tree, and takes the tree from 62 command buffers to 68. That
+    sentence ended "and back over the queue's knee" until 2026-08-18, as though
+    68 were a state to avoid; the queue blocks the enqueuing host thread when
+    it is full and drops nothing, and the depth is retired as a safety
+    criterion (`docs/GPU_PORTABILITY.md` 6.2). Six launches at 14 to 17
+    microseconds each is the whole of it, and it is enough: the batch pays the
+    copy-back in its own zeroing pass, in the launch it has to make anyway, and
+    the partition stays two.
 
     Every store here is a store one of the two kernels it replaces made, of the
     same value, to the same address, under the same guard -- the same argument
@@ -3230,11 +3272,20 @@ struct GpuLeafBatcher(Movable):
         arm it replaces, so the only difference between the two is which two
         kernel symbols the queue receives. That is a precondition rather than a
         happy result: `gpu_resident_round.oblivious_launch_census(6)` is 62
-        command buffers with two per level here, the Metal queue on the
-        measured machine is 64 deep and does not raise when overrun, and a
-        third launch per level would put a depth-6 tree at 68. A standalone
-        subtraction pass is exactly that third launch, which is why the
-        subtraction is folded into the accumulation instead
+        command buffers with two per level here, and a third launch per level
+        would put a depth-6 tree at 68.
+
+        **The clause between those two read "the Metal queue on the measured
+        machine is 64 deep and does not raise when overrun", and it is retired,
+        2026-08-18** (`docs/design/SWITCH_GRID.md` section 6 item 8). A full
+        Metal queue does not raise because it does not overrun: `commandBuffer`
+        blocks the enqueuing host thread until a buffer completes
+        (`docs/GPU_PORTABILITY.md` 6.2), and the leaf-wise plane ships at up to
+        2,303 buffers a tree and is the fastest arm here. What survives decides
+        this on its own, which is why the precondition still stands: six extra
+        launches a tree, at 14 to 17 microseconds each past the depth, for a
+        pass that has somewhere free to go. That is why the subtraction is
+        folded into the accumulation instead
         (`_batch_hist_atomic_subtract_kernel`) and the parent copy the lopsided
         case needs is folded into the zeroing
         (`_batch_copy_back_zero_subtract_kernel`). The deferred copy-back is

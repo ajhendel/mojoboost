@@ -11,6 +11,17 @@ waits at the default leaf budget, so it is past that knee for most of every
 tree. This fusion takes 30 of those out per tree, which is roughly 3,000 out of
 a hundred-tree fit.
 
+That is a PRICE argument and it is the only form the queue depth is now allowed
+to take. **The depth was retired as a safety criterion on 2026-08-18**
+(`docs/design/SWITCH_GRID.md` section 6 item 8): a full queue blocks the host
+thread that enqueues into it rather than dropping work, and this plane, at 308
+buffers a tree and 2,303 at a 256-leaf budget, was measured running exactly
+that way at commit 1d77414 -- `device_wait` at 0 calls, `encode` at 85.74
+percent of host time -- and is the fastest arm this package ships. Nothing in
+this file ever argued otherwise, and the paragraph above is left standing
+because "past that knee for most of every tree" is the measured fact the
+retirement rests on.
+
 The claim under test is not that this is faster. It is that it is **exact**:
 the same trees, node for node, with no tolerance anywhere. A schedule change
 that moved a bit would be worth nothing however fast it was, and this

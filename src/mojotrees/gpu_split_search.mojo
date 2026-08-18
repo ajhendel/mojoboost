@@ -3672,15 +3672,34 @@ def _scan_slot_wide_primitive_kernel(
 # **Why this is a kernel and not a launch.** The lane's own precondition is
 # that the cross-leaf reduction be FUSED into the existing per-level search
 # launch and never become a command buffer of its own. On Metal one
-# `enqueue_function` is one command buffer and the queue is 64 deep
-# (`docs/GPU_PORTABILITY.md` 6.2); the static census in
+# `enqueue_function` is one command buffer, and the static census in
 # `gpu_resident_round.oblivious_launch_census` shows depth 6 landing at 62
-# buffers per tree fused and 68 standalone, so a standalone reduce puts the
-# tree past the measured knee and the queue-depth argument for oblivious
-# evaporates at CatBoost's own default depth. The fusion here is the cheapest
-# possible one: the sum over leaves is the innermost loop of the scan that
-# already runs, and the launch count is unchanged at two -- this scan, then
-# `_reduce_slots_kernel` over one record instead of over a frontier.
+# buffers per tree fused and 68 standalone.
+#
+# **THIS PARAGRAPH USED TO END "so a standalone reduce puts the tree past the
+# measured knee and the queue-depth argument for oblivious evaporates at
+# CatBoost's own default depth", AND THAT CLAUSE IS RETIRED, 2026-08-18**
+# (`docs/design/SWITCH_GRID.md` section 6 item 8). The 64-deep queue is a
+# throttle and not a cliff. `MTLCommandQueue.commandBuffer` blocks the calling
+# host thread when the queue is full rather than returning nil, so 64 go in,
+# the host waits on the 65th until the first completes, and the stream runs one
+# in and one out (`docs/GPU_PORTABILITY.md` 6.2). Nothing is dropped and
+# nothing raises. The fastest arm this package ships is the leaf-wise
+# device-resident grower at 8 + 9 * (num_leaves - 1) buffers a tree, 2,303 at
+# 256 leaves, and the host-step profile at commit 1d77414 measured it running
+# backpressured, `device_wait` at exactly 0 calls and `encode` at 85.74 percent
+# of host time (`bench/results/RESUME_2026-08-18.md`). Passing 64 is not a
+# failure and there is no argument here to evaporate.
+#
+# **What survives is a price, and it decides this on its own.** The same
+# measurement puts enqueue at 6 to 7 microseconds under the depth and 14 to 17
+# over it, so the six buffers a standalone reduce adds are six of the dearest
+# launches in the tree, once per level, six per depth-6 tree and 600 per
+# hundred-tree fit. The fusion here is the cheapest possible one: the sum over
+# leaves is the innermost loop of the scan that already runs, and the launch
+# count is unchanged at two -- this scan, then `_reduce_slots_kernel` over one
+# record instead of over a frontier. A reduce that costs nothing to fuse and
+# six launches a tree to separate needs no other reason.
 
 comptime OBLIVIOUS_MAX_LEAVES = 256
 """Leaves in one oblivious level this kernel will scan, which is `2 ** 8`.
@@ -3725,11 +3744,15 @@ from hardware. So depth 8 needed no device query and no specialization.
 **And the 71 was from a superseded function.** It is
 `oblivious_launch_census(7)`, whose own docstring calls itself a frozen
 registered prediction for a schedule that did not exist yet. The built
-schedule, `oblivious_schedule_launches`, returns 63 at depth 7 and 73 at
-depth 8. Depth 7 was already under the knee and was refused anyway. The knee
-is in any case a throttle and not a cliff (`docs/GPU_PORTABILITY.md` 6.2),
-and the fastest arm this package ships runs 2,303 command buffers per tree
-past it.
+schedule, `oblivious_schedule_launches`, returns 63 at depth 7 and 71 at
+depth 8. (That second number read 73 for the few hours between this constant
+going to 256 and `gpu_leaf_batching.OBLIVIOUS_MAX_ITEMS` following it there;
+at a 64-item batcher a depth-8 level costs two batches rather than one, which
+is two command buffers, and it is now derived from this constant so the pair
+cannot part again.) Depth 7 was already under the knee and was refused anyway.
+The knee is in any case a throttle and not a cliff
+(`docs/GPU_PORTABILITY.md` 6.2), and the fastest arm this package ships runs
+2,303 command buffers per tree past it.
 
 **What actually bound, and what nobody wrote down**, was one leaf per thread
 in step 1 of the wide kernel against `OBLIVIOUS_WIDE_THREADS = 64`. That is
@@ -4117,6 +4140,17 @@ def _scan_slot_oblivious_kernel(
     # placeholder and no lane touches it.
     var noise_base = (table + slot) * nb
     var nl = Int(n_leaves)
+    # A level wider than the reservation is REFUSED ON THE HOST, in
+    # `_launch_oblivious_search`, before either scan kernel is enqueued, and
+    # both launch paths go through that one function (the no-noise overload
+    # delegates to it). This clamp is what a kernel can do instead of raising,
+    # since a `raise` is not expressible in one, and it exists only so that a
+    # regression in that guard reads a shared array in bounds rather than past
+    # its end. **It must never become the enforcement point**: silently
+    # scanning the first `OBLIVIOUS_MAX_LEAVES` leaves of a wider level builds
+    # a correct-looking tree from a fraction of the level and passes every
+    # invariant this package checks. The host raise is the enforcement and it
+    # names the number.
     if nl > OBLIVIOUS_MAX_LEAVES:
         nl = OBLIVIOUS_MAX_LEAVES
 
@@ -4627,11 +4661,26 @@ def _scan_slot_oblivious_kernel(
 
 
 #: Threads per feature slot in the wide oblivious scan. The same 64 as
-#: `WIDE_SCAN_THREADS`, and the same number for the same two reasons: it is the
-#: block size every `block.*` collective in this file is instantiated at, so a
-#: second size would be a second set of instantiations, and the Metal command
-#: queue is 64 deep (`docs/GPU_PORTABILITY.md` 6.2) so the threadgroup shape
-#: that has been exercised is the one to reuse.
+#: `WIDE_SCAN_THREADS`, because it is the block size every `block.*` collective
+#: in this file is instantiated at and a second size would be a second set of
+#: instantiations.
+#:
+#: **THE SECOND REASON THIS COMMENT GAVE IS RETIRED, 2026-08-18.** It read "and
+#: the Metal command queue is 64 deep (`docs/GPU_PORTABILITY.md` 6.2) so the
+#: threadgroup shape that has been exercised is the one to reuse". Two things
+#: are wrong with it. A queue depth counts command buffers in flight and says
+#: nothing about how many threads a block holds, so the two 64s are a
+#: coincidence and citing one for the other is a non sequitur. And the depth is
+#: a throttle rather than a bound in any case: a full queue blocks the host
+#: thread that enqueues into it and drops nothing, which is why the same 6.2
+#: now records the depth as retired as a safety criterion. The instantiation
+#: reason above is the whole reason.
+#:
+#: The coincidence did real damage and that is why it is written up rather than
+#: deleted. Step 1 of the wide kernel ran one leaf per thread against this 64
+#: and silently covered only the first 64 leaves of a wider level, which is the
+#: depth ceiling three docstrings blamed on threadgroup memory and on the
+#: queue. See the strided loop's comment in `_scan_slot_oblivious_wide_kernel`.
 comptime OBLIVIOUS_WIDE_THREADS = WIDE_SCAN_THREADS
 
 #: The most bins one thread of the wide oblivious scan can own, which bounds
@@ -4760,10 +4809,16 @@ def _scan_slot_oblivious_wide_kernel(
     thread sums that leaf's `n_bins` histogram cells into `tot_g`/`tot_h`/
     `tot_c`. Those are fixed-point Int32 accumulations over a fixed range in
     ascending bin order, identical to the narrow kernel's, and they are private
-    to a leaf so no two threads touch one. `n_leaves` is at most
-    `OBLIVIOUS_MAX_LEAVES`, which is 64, which is `OBLIVIOUS_WIDE_THREADS`, so
-    one leaf per thread covers a level exactly and threads past the level's
-    width idle. The per-leaf Float32 CONSTANTS derived from those sums --
+    to a leaf so no two threads touch one. **This sentence read "`n_leaves` is
+    at most `OBLIVIOUS_MAX_LEAVES`, which is 64, which is
+    `OBLIVIOUS_WIDE_THREADS`, so one leaf per thread covers a level exactly and
+    threads past the level's width idle" until 2026-08-18, and that identity
+    was the real depth ceiling**: `OBLIVIOUS_MAX_LEAVES` is 256 now and one
+    leaf per thread covered only the first 64. The loop is now a stride, `l =
+    tid` then `l += OBLIVIOUS_WIDE_THREADS`, and the argument here is unchanged
+    by it, because each leaf's sums read only that leaf's own bins and write
+    only that leaf's own shared slot, so which thread runs which leaf cannot
+    move a bit. The per-leaf Float32 CONSTANTS derived from those sums --
     `par_score`, `node_ss`, `cross_off`, and Cosine's `un_num`/`un_den` -- are
     each a pure function of one leaf's own totals, so computing them on
     different threads changes nothing.
@@ -4870,6 +4925,17 @@ def _scan_slot_oblivious_wide_kernel(
     var pf = record * PF_WORDS
     var noise_base = (table + slot) * nb
     var nl = Int(n_leaves)
+    # A level wider than the reservation is REFUSED ON THE HOST, in
+    # `_launch_oblivious_search`, before either scan kernel is enqueued, and
+    # both launch paths go through that one function (the no-noise overload
+    # delegates to it). This clamp is what a kernel can do instead of raising,
+    # since a `raise` is not expressible in one, and it exists only so that a
+    # regression in that guard reads a shared array in bounds rather than past
+    # its end. **It must never become the enforcement point**: silently
+    # scanning the first `OBLIVIOUS_MAX_LEAVES` leaves of a wider level builds
+    # a correct-looking tree from a fraction of the level and passes every
+    # invariant this package checks. The host raise is the enforcement and it
+    # names the number.
     if nl > OBLIVIOUS_MAX_LEAVES:
         nl = OBLIVIOUS_MAX_LEAVES
 
@@ -6574,10 +6640,20 @@ def _launch_oblivious_search(
     innermost loop of `_scan_slot_oblivious_kernel` rather than a launch beside
     it. The census this holds open is written out in
     `gpu_resident_round.oblivious_launch_census`: at depth 6 a tree is 62
-    command buffers fused and 68 with a standalone reduce, against a queue that
-    is 64 deep and whose per-launch enqueue cost is measured to roughly double
-    past that. Anything added here is added six times a tree and is spent at
-    the point where it is most expensive.
+    command buffers fused and 68 with a standalone reduce.
+
+    **That sentence used to end "against a queue that is 64 deep and whose
+    per-launch enqueue cost is measured to roughly double past that", with the
+    depth doing the work and the cost as a footnote. The two are now the other
+    way round, 2026-08-18.** The depth is not a bound an arm can be unsafe
+    past: a full Metal queue blocks the enqueuing host thread on the next
+    `commandBuffer` rather than dropping or failing anything
+    (`docs/GPU_PORTABILITY.md` 6.2), and the leaf-wise grower this package
+    ships as its fastest arm runs 2,303 buffers a tree past it. The measured
+    doubling is the part that was always true and is now the whole reason: 6 to
+    7 microseconds an enqueue under the depth and 14 to 17 over it, and this
+    plane is over it for most of every tree. Anything added here is added six
+    times a tree at the expensive rate.
 
     The reduction is `_reduce_slots_kernel` unchanged, over
     `record_base = level_record` and one record. Nothing about it is oblivious:

@@ -507,12 +507,41 @@ comptime AUTO_MIN_CELLS = CROSSOVER_DISABLED
 # as "the switch is set": neither says the code was reached. What caught it
 # was one fit at each depth on each backend, which is four seconds of work.
 #
-# 8 rather than 6 because the wide oblivious scan's twelve shared arrays are
-# 12,300 bytes at 256 leaves against a conservative 16,384-byte threadgroup
-# budget. 9 is where that genuinely binds, at 24,588 bytes. See
-# `gpu_split_search.OBLIVIOUS_MAX_LEAVES`, which holds the arithmetic and the
-# account of the three justifications that turned out not to bind.
-comptime OBLIVIOUS_DEVICE_MAX_DEPTH = 8
+# 7 RATHER THAN 8, AND THE DIFFERENCE IS THE WHOLE POINT OF THIS COMMENT.
+#
+# The memory arithmetic supports 8: the wide oblivious scan's twelve shared
+# arrays are 12,300 bytes at 256 leaves against a conservative 16,384-byte
+# threadgroup budget, and 9 is where that genuinely binds at 24,588. Three
+# separate constants were raised to 256 on the strength of it and every one of
+# those raises is correct.
+#
+# The bound is 7 because 7 is what a fit actually reaches. Measured 2026-08-18,
+# symmetric, 60,000 x 24, eight trees, one fit at each depth on each backend:
+#
+#     depth 6  cpu ok  gpu ok, rmse bit-identical at 0.332497
+#     depth 7  cpu ok  gpu ok, rmse bit-identical at 0.322253
+#     depth 8  cpu ok  gpu raises "active-row ranges do not cover the active
+#                      prefix"
+#     depth 9  cpu ok  gpu refused here, which is correct
+#
+# Depth 8 does not hit a capacity refusal. It hits an INVARIANT in the
+# active-row range machinery, which is a real defect in the level plane at 256
+# leaves and not a sizing question. Advertising a depth whose fits raise an
+# internal invariant message is worse than advertising one less depth, because
+# the message is not something a user can act on.
+#
+# **This is the rule applied to itself.** A lifted bound is verified by a fit
+# at the new bound, or it is not lifted. That rule was written today after
+# this same bound was raised to 8, built clean, and shipped with a commit
+# message saying the ceiling was gone while depth 7 and 8 both still refused.
+# Raising it to 8 a second time on arithmetic alone would have been the same
+# error with better arithmetic.
+#
+# WHAT MOVES IT TO 8: fix the range containment at 256 leaves, then one fit at
+# depth 8 on both backends in the same commit. The constants are already
+# sized. See `gpu_split_search.OBLIVIOUS_MAX_LEAVES` for the account of the
+# three justifications that turned out not to bind.
+comptime OBLIVIOUS_DEVICE_MAX_DEPTH = 7
 
 comptime POLICY_VERSION = 10
 

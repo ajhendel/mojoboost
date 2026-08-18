@@ -2552,13 +2552,25 @@ struct GpuHistogramBuilder(Movable):
 
         `max_items` is the widest batch the pool's batcher will ever be asked to
         build, and it is a parameter rather than a constant because
-        `grow_policy = oblivious` needs it to be 64 and the default is 32. That
-        is not a preference: a depth-6 level's last generation has 64 children,
-        at the default bound it needs two batches, and
-        `gpu_resident_round.oblivious_launch_census(6, batch_max_items=32)` lands
-        the tree at exactly 64 command buffers -- on the queue-depth knee rather
-        than under it. See `gpu_leaf_batching.OBLIVIOUS_MAX_ITEMS`. The leaf-wise
-        plane passes the default and is unchanged.
+        `grow_policy = oblivious` needs one item per child of the widest level
+        and the leaf-wise default is 32. That is not a preference: a depth-6
+        level's last generation has 64 children, so at the default bound it
+        needs two batches, and the extra pair of command buffers buys nothing
+        at all -- the same children, from the same plan, into the same slots.
+
+        **The last clause of this paragraph used to read "lands the tree at
+        exactly 64 command buffers -- on the queue-depth knee rather than under
+        it", and the knee is retired as a bound, 2026-08-18**
+        (`docs/design/SWITCH_GRID.md` section 6 item 8). A full Metal queue
+        blocks the host thread that enqueues into it rather than losing work
+        (`docs/GPU_PORTABILITY.md` 6.2), and the leaf-wise plane this same
+        builder serves runs hundreds to thousands of buffers a tree past 64. So
+        64 was never a line to stay under. What is left is the enqueue price, 6
+        to 7 microseconds under the depth and 14 to 17 over it, paid twice a
+        tree for nothing, which is reason enough to pass the wider bound and is
+        why `oblivious_level_fits` still refuses the narrower one. See
+        `gpu_leaf_batching.OBLIVIOUS_MAX_ITEMS`. The leaf-wise plane passes the
+        default and is unchanged.
 
         All or nothing, and deliberately so. A leaf-wise frontier holds a
         slot per live leaf for the whole tree, so a pool one slot short does
@@ -3064,23 +3076,49 @@ struct GpuHistogramBuilder(Movable):
         # histograms a depth-6 tree builds pay the maintenance and read none of
         # it.
         #
-        # **Why that is a refusal rather than a slow arm.**
-        # `gpu_resident_round.oblivious_schedule_launches(6, 64, True)` is 55,
+        # **Why that is a refusal rather than a slow arm. The reason given
+        # here until 2026-08-18 was wrong, and the two that replace it were
+        # always the stronger ones.** It read:
+        # "`gpu_resident_round.oblivious_schedule_launches(6, 64, True)` is 55,
         # and 55 + 13 is 68 against a Metal queue that is 64 deep on the
         # measured machine and DOES NOT RAISE when it is overrun. The failure
         # mode is therefore not a slower fit, it is an overrun queue that says
         # nothing, which is not a state to leave reachable from an environment
-        # variable. Raising here costs one host field read per tree.
+        # variable."
+        #
+        # A full Metal queue does not raise because there is nothing to raise
+        # about. `MTLCommandQueue.commandBuffer` blocks the calling host thread
+        # until a buffer completes rather than returning nil, so the stream
+        # throttles to one in and one out and nothing is dropped
+        # (`docs/GPU_PORTABILITY.md` 6.2, retired as a safety criterion in
+        # `docs/design/SWITCH_GRID.md` section 6 item 8). The failure mode IS a
+        # slower fit, which is exactly what that text denied: 68 launches each
+        # costing 14 to 17 microseconds instead of 6 to 7. And the leaf-wise
+        # plane beside this one runs 278 to 2,303 buffers a tree, was measured
+        # backpressured at commit 1d77414 with `device_wait` at 0 calls and
+        # `encode` at 85.74 percent of host time, and is the fastest arm this
+        # package ships.
+        #
+        # **What the refusal stands on instead, twice over.** The arm was BUILT
+        # and MEASURED and it LOST: 0.757x on the device-MVS arm at 463,715 x
+        # 90, 100 trees, symmetric depth 6, bit-identical models, recorded as
+        # MEASURED NEGATIVE in `docs/design/DECLINED_OPTIMIZATIONS.md` row C1.
+        # A 24 percent loss is not a state to leave reachable from an
+        # environment variable. And on this plane the arm is not merely
+        # unprofitable, it is inert: 13 command buffers a tree of compaction
+        # maintenance, of which 62 of the 63 histograms a depth-6 tree builds
+        # read nothing at all. Either reason carries the refusal alone.
+        # Raising here costs one host field read per tree.
         if self.rows.row_compaction_requested():
             raise Error(
                 "row compaction is not supported under"
                 " grow_policy=oblivious: nothing in the level build reads the"
                 " compacted planes, so the arm costs one rebuild plus two"
                 " maintenance launches per level (13 on a depth-6 tree) and"
-                " collects nothing but the root build, which puts the tree at"
-                " 68 command buffers against a 64-deep queue that does not"
-                " raise when it is overrun. Unset MOJOTREES_GPU_ROW_COMPACTION,"
-                " or grow leaf-wise."
+                " collects nothing but the root build. The consumer it was"
+                " waiting for was built and measured 0.757x, a 24 percent"
+                " loss, on 463,715 rows by 90 features. Unset"
+                " MOJOTREES_GPU_ROW_COMPACTION, or grow leaf-wise."
             )
         return self.batcher[0].stage_device_plan(
             n_items,

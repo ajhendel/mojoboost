@@ -1712,14 +1712,33 @@ def resident_round_supported(
 
 # --- grow_policy = oblivious: the launch census, before the code ----------
 #
-# `docs/design/OBLIVIOUS.md` B5 registers one kill criterion ahead of any
+# `docs/design/OBLIVIOUS.md` B5 registered one kill criterion ahead of any
 # number: if a level schedule does not bring the per-tree command-buffer count
-# under 64 -- the measured queue-depth knee, `docs/GPU_PORTABILITY.md` 6.2 and
-# the ladder in `bench/results/session3_2026-08-16/RESULTS.md` -- then the
+# under 64 -- the queue-depth knee, `docs/GPU_PORTABILITY.md` 6.2 and the
+# ladder in `bench/results/session3_2026-08-16/RESULTS.md` -- then the
 # queue-depth argument for oblivious evaporates and only the accuracy question
 # remains. What follows is that census, computed against the code as it stands
 # rather than against the design's estimate, and it does not say what the
 # design says.
+#
+# **THE KILL CRITERION ITSELF IS RETIRED, 2026-08-18**
+# (`docs/design/SWITCH_GRID.md` section 6 item 8). It was written as a gate and
+# it never was one. 64 is where a Metal queue starts blocking the host thread
+# that enqueues into it, not where it starts losing work: `commandBuffer`
+# blocks when the queue is full rather than returning nil, so the stream
+# throttles to one in and one out and nothing is dropped or failed. The
+# leaf-wise grower in this same file enqueues 8 + 9 * (num_leaves - 1) buffers
+# a tree, 278 at 31 leaves and 2,303 at 256, and the host-step profile at
+# commit 1d77414 measured it running exactly that way, `device_wait` at 0 calls
+# and `encode` at 85.74 percent of host time
+# (`bench/results/RESUME_2026-08-18.md`) -- and it is the fastest arm this
+# package ships.
+#
+# So the census below is a PRICE LIST and not a pass-or-fail test. Every count
+# in it is still worth having, at 6 to 7 microseconds an enqueue under 64 and
+# 14 to 17 over it; none of them decides whether an arm may run. The refusals
+# downstream that cited the criterion are corrected at their own definitions,
+# and two of them stand on other grounds and are not permissions now.
 
 comptime OBLIVIOUS_LEAF_INDEX_RULE = (
     "leaf index = sum over levels l of bit_l * 2**l, so the FIRST level's"
@@ -1847,10 +1866,16 @@ def oblivious_launch_census(
       them, so the histogram term is `2 * ceil(2^(l+1) / m)`. **This is not a
       formality at the default bound.** `gpu_leaf_batching.DEFAULT_MAX_ITEMS`
       is 32, a depth-6 tree's last level has 64 children, and the extra batch
-      that costs puts the tree at **64 -- on the knee rather than under it**.
-      A batcher constructed with `max_items >= 64` is therefore a precondition
-      of the whole queue-depth argument at CatBoost's default depth, not a
-      sizing preference, and it is cheap: the item table is
+      that costs puts the tree at **64 rather than 62**.
+
+      That pair used to be read as a knee to stay under, and this text called
+      `max_items >= 64` "a precondition of the whole queue-depth argument at
+      CatBoost's default depth, not a sizing preference". **The queue-depth
+      argument is retired, 2026-08-18**: a full queue blocks the enqueuing host
+      thread and drops nothing (`docs/GPU_PORTABILITY.md` 6.2), so 64 is a
+      price and not a precondition. The wider bound is still the one to pass,
+      for the reason under `OBLIVIOUS_LEVEL_HISTOGRAM` -- the two extra buffers
+      buy nothing -- and it is cheap: the item table is
       `max_items * (ITEM_WORDS + 2)` Int32 plus `max_items * n_features` for
       the feature table.
 
@@ -1907,10 +1932,44 @@ def oblivious_launch_census(
 
 comptime OBLIVIOUS_OK = 0
 comptime OBLIVIOUS_DEPTH = 1
-"""`max_depth` outside `[1, 6]`. Depth 6 is CatBoost's default and is the last
-one under the queue's 64-buffer knee (`oblivious_launch_census`); it is also
-what `gpu_split_search.OBLIVIOUS_MAX_LEAVES` reserves per-leaf scan state
-for, and the two limits agreeing is not a coincidence."""
+"""`max_depth` outside `[1, 7]`, which is what `oblivious_device_supported` and
+`grow_tree_device_oblivious` test.
+
+**THIS DOCSTRING SAID `[1, 6]` AND GAVE TWO REASONS FOR IT. ONE IS DEAD AND THE
+OTHER MOVED, both on 2026-08-18.** It read: "Depth 6 is CatBoost's default and
+is the last one under the queue's 64-buffer knee (`oblivious_launch_census`);
+it is also what `gpu_split_search.OBLIVIOUS_MAX_LEAVES` reserves per-leaf scan
+state for, and the two limits agreeing is not a coincidence."
+
+The queue clause is retired (`docs/design/SWITCH_GRID.md` section 6 item 8). A
+full Metal command queue blocks the enqueuing host thread rather than dropping
+or failing anything (`docs/GPU_PORTABILITY.md` 6.2), so there is no depth past
+which a tree is unsafe, only one past which each launch costs 14 to 17
+microseconds instead of 6 to 7. The count was stale as well as the reasoning:
+71 at depth 7 is `oblivious_launch_census`, a frozen prediction of a schedule
+that was never built, and the schedule that runs, `oblivious_schedule_launches`
+at the shipped `skip_last_build` and `OBLIVIOUS_MAX_ITEMS`, is 63 at depth 7
+and 71 at depth 8. Depth 7 was already under 64 and was refused anyway. And
+"CatBoost's default" is a default rather than a limit, so it was never a reason
+at all.
+
+**What survives is the reservation, and it is a real compile-time bound.**
+`gpu_split_search.OBLIVIOUS_MAX_LEAVES` is 256 since 2026-08-18, which is depth
+8, and it sizes a threadgroup allocation at compile time: 12,300 bytes at 256
+leaves against the 16,384-byte conservative budget, where 512 leaves would need
+24,588 and does not fit. So the ceiling is 8, it moved because that allocation
+moved, and it will move again only when that allocation does. There is one
+limit here now rather than two agreeing ones.
+
+A depth this plane admits can still be refused downstream by
+`OBLIVIOUS_LEVEL_HISTOGRAM`, which asks two questions of the builder: whether
+one batch holds the level's children, and whether the slot pool holds a
+histogram for each of them. The first was a second copy of this ceiling at 64
+until 2026-08-18 and is now `gpu_leaf_batching.OBLIVIOUS_MAX_ITEMS`, derived
+from `OBLIVIOUS_MAX_LEAVES` so the two cannot part again. The second is the
+pool, sized by the caller from `oblivious_leaf_budget`, and at depth 8 it is
+256 slots of `3 * n_features * n_bins` Int32 apiece, which is tens of megabytes
+and is the term that decides whether a deep symmetric fit runs at all."""
 
 comptime OBLIVIOUS_LEVEL_HISTOGRAM = 2
 """The histogram pool this builder holds cannot build a whole level in one
@@ -1925,13 +1984,28 @@ descriptor partition's deferred copy-back inside the zeroing pass it launches
 anyway. What was missing was the growth loop calling it, and
 `GpuHistogramBuilder.enqueue_desc_level_children` is that call.
 
-What survives is the **sizing precondition, which is not a preference.** A
-depth-6 level offers 64 children and `gpu_leaf_batching.DEFAULT_MAX_ITEMS` is
-32, so a batcher at the default bound needs two batches for the last level and
-`oblivious_launch_census(6, batch_max_items=32)` is exactly 64 -- on the knee
+What survives is the **sizing test, and its stated reason changed on
+2026-08-18.** A depth-6 level offers 64 children and
+`gpu_leaf_batching.DEFAULT_MAX_ITEMS` is 32, so a batcher at the default bound
+needs two batches for the last level and pays two extra command buffers.
+
+This paragraph used to price those two buffers as fatal. It read
+"`oblivious_launch_census(6, batch_max_items=32)` is exactly 64 -- on the knee
 rather than under it, where the same census at 64 items is 62. So a builder
 whose batcher was opened for the leaf-wise plane refuses here rather than
-growing a tree whose queue-depth argument does not hold.
+growing a tree whose queue-depth argument does not hold." **The queue-depth
+argument is retired** (`docs/design/SWITCH_GRID.md` section 6 item 8): 64 is
+where the host thread starts blocking on `commandBuffer`, not where work is
+lost, and the leaf-wise plane this builder also serves runs thousands of
+buffers a tree past it. A tree at 64 buffers is a tree paying 14 to 17
+microseconds for its last enqueues instead of 6 to 7. Nothing about it "does
+not hold".
+
+**The refusal stands on the reason that never needed the queue.** The two extra
+command buffers buy nothing at all -- the same children, from the same plan,
+into the same slots, bit for bit -- and they are avoidable by passing one
+parameter, so a builder opened for the leaf-wise plane is turned back here
+rather than routed onto the strictly worse shape without saying so.
 `GpuHistogramBuilder.open_resident` takes the bound as a parameter and
 `gpu_leaf_batching.OBLIVIOUS_MAX_ITEMS` is the value this mode passes.
 
@@ -2047,7 +2121,7 @@ def oblivious_reason_name(reason: Int) -> String:
     if reason == OBLIVIOUS_OK:
         return String("ok")
     if reason == OBLIVIOUS_DEPTH:
-        return String("max_depth outside 1..8")
+        return String("max_depth outside 1..7")
     if reason == OBLIVIOUS_LEVEL_HISTOGRAM:
         return String("the histogram batcher cannot hold a whole level")
     if reason == OBLIVIOUS_ROW_RANGES:
@@ -2111,7 +2185,7 @@ def oblivious_device_supported(
     """
     if params.grow_policy != GROW_OBLIVIOUS:
         return OBLIVIOUS_TABLES
-    if params.max_depth < 1 or params.max_depth > 8:
+    if params.max_depth < 1 or params.max_depth > 7:
         return OBLIVIOUS_DEPTH
     if builder.cats.any_categorical():
         return OBLIVIOUS_CATEGORICAL
@@ -3609,15 +3683,26 @@ def oblivious_schedule_launches(
     counted; it counted the leaf-wise phase list, and a level does not need the
     record-filing phase.
 
-    **The sizing precondition survives the gap and is not weakened by it.** At
-    `max_items = 32` this schedule is 58 rather than 62, which is under the
-    knee -- so on this schedule the default bound would not by itself break the
-    queue-depth argument. It is still refused (`OBLIVIOUS_LEVEL_HISTOGRAM`), for
-    two reasons that are about not spending the margin rather than about having
-    already spent it: the two extra command buffers buy nothing at all, and the
-    census the mode was admitted on is the 62/64 pair, so a build that quietly
-    runs at a bound the census calls the knee is a build whose registered
-    argument no longer describes it.
+    **The sizing test survives the gap and one of its two reasons did not.** At
+    `max_items = 32` this schedule is 58 rather than 62.
+
+    This paragraph used to continue "which is under the knee -- so on this
+    schedule the default bound would not by itself break the queue-depth
+    argument", and "break" was the word doing the damage. **Nothing breaks a
+    64-deep Metal queue.** It blocks the host thread that enqueues into it and
+    runs one in and one out (`docs/GPU_PORTABILITY.md` 6.2), the leaf-wise
+    plane ships at up to 2,303 buffers a tree, and the depth is retired as a
+    safety criterion as of 2026-08-18 (`docs/design/SWITCH_GRID.md` section 6
+    item 8).
+
+    The refusal (`OBLIVIOUS_LEVEL_HISTOGRAM`) stands on the reason that never
+    depended on the queue: the two extra command buffers buy nothing at all, at
+    6 to 7 microseconds each under the depth and 14 to 17 over it, and one
+    parameter to `open_resident` avoids them. The other half of the old reason,
+    that the census the mode was admitted on is the 62/64 pair and a build at
+    the narrower bound is one the registered argument no longer describes, is
+    bookkeeping about a registration and is recorded here as that rather than
+    as a claim about safety.
 
     What is deliberately not counted here at `skip_last_build = False`,
     exactly as the census does not count it: the last level's children. Those
@@ -3783,8 +3868,19 @@ def grow_tree_device_oblivious(
         build every child of the level          2   one batch, copy-back fused
 
     so a whole tree is `7 + 6 * max_depth + 1 + 2 * max_depth` at
-    `max_items >= 64`, which is **56** at CatBoost's default depth of 6 against
-    a queue that is 64 deep. The leaf-wise plane at its default budget is 278.
+    `max_items >= 64`, which is **56** at CatBoost's default depth of 6, and 55
+    under the shipped `skip_last_build`. The leaf-wise plane is 278 at its
+    default 31-leaf budget and 2,303 at 256 leaves.
+
+    That sentence used to end "against a queue that is 64 deep", which invited
+    56 to be read as a pass. There is no test to pass. A full Metal queue
+    blocks the enqueuing host thread and loses nothing
+    (`docs/GPU_PORTABILITY.md` 6.2, retired as a safety criterion 2026-08-18),
+    and the 278-buffer plane beside this one is the faster of the two, measured
+    backpressured at commit 1d77414. The counts are kept because launches are
+    the price -- 6 to 7 microseconds each under the depth, 14 to 17 over it --
+    and because a profile charged against this function has to describe the
+    schedule that ran.
 
     Three of those five phases are the same launches the leaf-wise plane makes,
     aimed at a level instead of at a split, and that is the load-bearing claim
@@ -3804,8 +3900,10 @@ def grow_tree_device_oblivious(
     - **The children are one batch for the whole level.** The commit writes the
       plan on the device, in the launch it was already making, and the batch
       carries the partition's deferred copy-back in its zeroing pass. Without
-      that fusion the partition would be three launches, six more per tree, and
-      the census would land the wrong side of the knee.
+      that fusion the partition would be three launches and six more per tree.
+      This line ended "and the census would land the wrong side of the knee"
+      until 2026-08-18; there is no wrong side, only six more of the most
+      expensive launches in the tree (see the census preamble above).
 
     Round trips: **one per tree**, the download at the end, exactly as the
     leaf-wise plane. Nothing in the loop below reads a device answer.
@@ -3901,10 +3999,15 @@ def grow_tree_device_oblivious(
         raise Error("a tree needs at least one active feature")
     if not builder.desc_tables_open():
         raise Error("open_resident_tables has not run on this builder")
-    if params.max_depth < 1 or params.max_depth > 8:
+    # The guard has read `> 8` since `gpu_split_search.OBLIVIOUS_MAX_LEAVES`
+    # went to 256 leaves, and this string still said `[1, 6]`, which is a user
+    # reading a limit the code stopped enforcing. The 6 came from the retired
+    # queue-depth argument (see `OBLIVIOUS_DEPTH`); the 8 is the threadgroup
+    # allocation the scan sizes at compile time.
+    if params.max_depth < 1 or params.max_depth > 7:
         raise Error(
             "grow_policy=oblivious on the device is implemented for max_depth"
-            " in [1, 6]; see OBLIVIOUS_DEPTH"
+            " in [1, 7]; see OBLIVIOUS_DEPTH"
         )
     if speculative_build_enabled():
         raise Error(

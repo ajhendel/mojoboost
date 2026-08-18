@@ -3,9 +3,9 @@ cross-leaf reduction that census makes mandatory.
 
 Two things are asserted here and they answer two different questions.
 
-**The census.** `docs/design/OBLIVIOUS.md` B5 registers one kill criterion
+**The census.** `docs/design/OBLIVIOUS.md` B5 registered one kill criterion
 ahead of any number: unless a level schedule brings the per-tree command-buffer
-count under 64 -- the measured queue-depth knee -- the queue-depth argument for
+count under 64 -- the queue-depth knee -- the queue-depth argument for
 oblivious evaporates and only the accuracy question is left. The arithmetic is
 `gpu_resident_round.oblivious_launch_census` and the tests below pin it to the
 table the round was opened on, so that "62 fused, 68 standalone, at CatBoost's
@@ -13,6 +13,17 @@ own default depth of 6" is a value something checks rather than a sentence in a
 docstring. They also pin the refusals, because the census found two things the
 design assumed and the code does not provide, and a refusal nothing names is a
 refusal that gets forgotten.
+
+**THE KILL CRITERION IS RETIRED, 2026-08-18, AND THE COUNTS ARE NOT.**
+`docs/design/SWITCH_GRID.md` section 6 item 8 carries the retirement. 64 is
+where a Metal queue starts blocking the host thread that enqueues into it, not
+where it starts losing work, and the leaf-wise plane this package ships as its
+fastest arm runs 278 to 2,303 command buffers a tree past it, measured
+backpressured at commit 1d77414. So every assertion below that compares a
+census against `_QUEUE_DEPTH` is asserting a COUNT and a PRICE -- 6 to 7
+microseconds an enqueue under the depth, 14 to 17 over it -- and none of them
+is asserting that an arm is safe or unsafe. The tests are unchanged in
+substance; what changed is what a passing one means.
 
 **The reduction.** `gpu_split_search._scan_slot_oblivious_kernel` is what makes
 the fused arm possible: the sum over a level's leaves is the innermost loop of
@@ -86,7 +97,10 @@ from mojotrees.gpu_split_search import (
 # (`docs/GPU_PORTABILITY.md` 6.2). Per-launch enqueue cost is measured flat at
 # 6 to 7 microseconds through 64 and 14 to 17 beyond
 # (`bench/results/session3_2026-08-16/RESULTS.md`). A knee, not a wall, which
-# is why the tests below say "under by two" rather than "safe".
+# is why the tests below say "under by two" rather than "safe" -- and since
+# 2026-08-18 it is not a wall in the weaker sense either: a full queue blocks
+# the enqueuing host thread and drops nothing, so this constant is the point
+# where a launch gets dearer and is not a bound on anything.
 comptime _QUEUE_DEPTH = 64
 
 
@@ -110,8 +124,10 @@ def test_depth_six_is_the_knife_edge_and_the_fusion_is_what_decides_it(
 ) raises:
     # The whole reason the reduction is a loop inside a kernel instead of a
     # kernel of its own. At CatBoost's default depth the fused schedule is
-    # under the measured knee and the standalone one is over it, and the gap
-    # between them is exactly the six launches a per-level reduce would add.
+    # under the knee and the standalone one is over it, and the gap between
+    # them is exactly the six launches a per-level reduce would add. Since
+    # 2026-08-18 that is a price and not a verdict: six launches move from 6-7
+    # microseconds each to 14-17, and no arm is unsafe on either side.
     assert_true(oblivious_launch_census(6) < _QUEUE_DEPTH)
     assert_true(oblivious_launch_census(6, fused_reduce=False) > _QUEUE_DEPTH)
     assert_equal(
@@ -122,10 +138,18 @@ def test_depth_six_is_the_knife_edge_and_the_fusion_is_what_decides_it(
     # Depth 5 is under either way, so a lane that built the standalone version
     # and tested it at depth 5 would have seen nothing wrong.
     assert_true(oblivious_launch_census(5, fused_reduce=False) < _QUEUE_DEPTH)
-    # Depth 7 is over either way, which is the other half of why 6 is the
-    # bound `OBLIVIOUS_MAX_LEAVES` reserves state for.
+    # Depth 7 is over either way on the CENSUS, which is the frozen prediction;
+    # the schedule that runs is 63 there, and that gap is the subject of
+    # `test_the_schedule_as_built_is_counted_and_the_gap_is_named`.
     assert_true(oblivious_launch_census(7) > _QUEUE_DEPTH)
-    assert_equal(OBLIVIOUS_MAX_LEAVES, 64)
+    # **This asserted 64 until 2026-08-18 and the constant is 256.** It was
+    # 2**6 because that is CatBoost's default depth, and it was defended by a
+    # threadgroup budget that belonged to a different kernel and by the queue
+    # depth retired above. The real bound is the wide scan's twelve shared
+    # arrays: 12,300 bytes at 256 leaves against the 16,384-byte conservative
+    # budget, where 512 leaves would need 24,588. So the ceiling is depth 8 and
+    # it moves when that allocation moves.
+    assert_equal(OBLIVIOUS_MAX_LEAVES, 256)
 
 
 def test_the_census_beats_leaf_wise_at_every_depth_it_admits() raises:
@@ -142,10 +166,18 @@ def test_the_census_beats_leaf_wise_at_every_depth_it_admits() raises:
 def test_the_batch_item_bound_is_the_census_precondition() raises:
     # The one sizing number this mode cannot be left to a default on. A
     # depth-6 level's last generation has 64 children; at the default bound of
-    # 32 that level needs two batches, which costs two command buffers and puts
-    # the tree exactly ON the measured knee.
+    # 32 that level needs two batches, which costs two command buffers that buy
+    # nothing at all. It used to be put as "puts the tree exactly ON the
+    # measured knee", which read as a safety line and is not one.
     assert_equal(DEFAULT_MAX_ITEMS, 32)
-    assert_equal(OBLIVIOUS_MAX_ITEMS, 64)
+    # **This asserted 64 until 2026-08-18.** The constant is derived from
+    # `OBLIVIOUS_MAX_LEAVES` now, because the level-width bound was written
+    # down four times, a lane raised two of them, and a depth-8 fit passed the
+    # policy layer and then failed at the batcher. A level of `L` parents makes
+    # `2L` children and one batch must hold them all, so the two are the same
+    # number by construction.
+    assert_equal(OBLIVIOUS_MAX_ITEMS, 256)
+    assert_equal(OBLIVIOUS_MAX_ITEMS, OBLIVIOUS_MAX_LEAVES)
     assert_equal(oblivious_launch_census(6, batch_max_items=64), 62)
     assert_equal(oblivious_launch_census(6, batch_max_items=32), 64)
     assert_true(oblivious_launch_census(6, batch_max_items=64) < _QUEUE_DEPTH)
@@ -165,7 +197,8 @@ def test_the_schedule_as_built_is_counted_and_the_gap_is_named() raises:
     # `oblivious_launch_census` is the registered model and is not edited after
     # the fact; `oblivious_schedule_launches` is the built thing. They differ by
     # one launch per level, which is the record-filing phase a level does not
-    # need, and both are under the knee at `max_items >= 64`.
+    # need. Both are under 64 at `max_items >= 64`, which is a fact about the
+    # counts and, since 2026-08-18, about nothing else.
     assert_equal(OBLIVIOUS_LEVEL_LAUNCHES, 6)
     assert_equal(oblivious_schedule_launches(6), 56)
     assert_equal(oblivious_schedule_launches(6, batch_max_items=32), 58)
@@ -727,9 +760,14 @@ def test_a_level_wider_than_the_reservation_is_refused() raises:
     comptime if not has_accelerator():
         print("skipped: no accelerator")
     else:
-        # Depth 7 is 128 leaves and is over the queue's knee whatever this
-        # kernel does, so the refusal is a named one at the launch rather than
-        # a silently truncated scan.
+        # A level wider than `OBLIVIOUS_MAX_LEAVES` is refused by name at the
+        # launch rather than silently truncated, which is the whole point: the
+        # two scan kernels clamp `nl` because a kernel cannot raise, and a
+        # clamped scan builds a correct-looking tree out of a fraction of the
+        # level. This comment read "Depth 7 is 128 leaves and is over the
+        # queue's knee whatever this kernel does"; depth 7 is 128 leaves and is
+        # now INSIDE the reservation (256), and the queue clause is retired.
+        # The refusal under test is the one on level width, at any depth.
         var flat: List[Int] = [1, 1, 1, 1]
         var words = _level_words(1, 4, _one(flat), _one(flat), _one(flat))
         var searcher = GpuSplitSearcher(1, 4)
@@ -1088,14 +1126,16 @@ def test_a_second_round_of_gradients_still_grows_the_same_tree() raises:
         _assert_same_shape(host, second, String("round 2"))
 
 
-def test_the_default_item_bound_refuses_rather_than_landing_on_the_knee(
+def test_the_default_item_bound_refuses_rather_than_paying_for_nothing(
 ) raises:
     comptime if not has_accelerator():
         print("skipped: no accelerator")
     else:
         # A builder whose batcher was opened for the leaf-wise plane holds 32
         # items. A depth-6 level wants 64, and the refusal is by name rather
-        # than a silent second batch.
+        # than a silent second batch. This test was called
+        # `..._rather_than_landing_on_the_knee` until 2026-08-18; the knee is a
+        # price and the refusal is about a second batch buying nothing.
         var n_rows = 300
         var features = _dense(n_rows, 4)
         var data = bin_equal_width(features, n_rows, 4, 16)
@@ -1152,10 +1192,16 @@ def test_the_other_refusals_are_reachable_by_name() raises:
         var builder = GpuHistogramBuilder(data)
         builder.upload_gradients(_grads(n_rows, features), _ones(n_rows))
         assert_true(builder.open_resident(64, OBLIVIOUS_MAX_ITEMS))
-        # Depth 7 is 128 leaves: over the scan's per-leaf reservation and over
-        # the queue's knee whatever the schedule does.
+        # **This asked depth 7 until 2026-08-18 and depth 7 is now supported.**
+        # The ceiling moved to 8 with `OBLIVIOUS_MAX_LEAVES` at 256 leaves, so
+        # the first depth outside `[1, 8]` is 9 and that is what the refusal
+        # has to be asked about. The old comment read "Depth 7 is 128 leaves:
+        # over the scan's per-leaf reservation and over the queue's knee
+        # whatever the schedule does"; the reservation holds 128 now and the
+        # queue clause is retired. What still binds at depth 9 is threadgroup
+        # memory, 24,588 bytes against a 16,384-byte conservative budget.
         assert_equal(
-            oblivious_device_supported(_tree_params(max_depth=7), builder),
+            oblivious_device_supported(_tree_params(max_depth=9), builder),
             OBLIVIOUS_DEPTH,
         )
         assert_equal(
