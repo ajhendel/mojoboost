@@ -4,6 +4,20 @@ Written 2026-08-17 by reading the source at head. Nothing here was measured on
 a run; every row names the line that decides it, so any one row can be checked
 without re-deriving the table.
 
+> **CORRECTED 2026-08-18, and the way this file went stale is worth more than
+> the correction.** The `MOJOTREES_GPU_ROW_COMPACTION` row, item 3 of "Edits
+> owed by other lanes" and item 6 of "What could not be verified without a
+> compiler" all left the same question open in three places. It was answered
+> the next day, in `docs/design/PATH_COVERAGE.md`, whose section 3A.1 opens by
+> saying that THIS file "left it as SUSPECTED ACCIDENTAL, not fully traced. It
+> is now traced" -- and then nobody came back and edited this file. So for a
+> day the repository held a document that recorded a question as closed and a
+> second document that still asked it, and a reader arriving at this one got
+> the stale answer. **A trace written in a new file does not close an item in
+> an old one. Close it where it was opened, in the same session, or it stays
+> open to everyone who reads the old file first.** All three places are now
+> edited in place and each quotes what it used to say.
+
 The question this file answers was asked as "if a switch is good for one,
 shouldn't it be good for all". The answer twice that day was yes, and both
 times the switch had been sitting off on a plane nobody had checked it against.
@@ -65,7 +79,7 @@ it, which is a defect.
 | `MOJOTREES_GPU_SPLIT_TABLE_PACK` (four uploads to one) | `gpu_split_search.mojo` | REACHES | REACHES via `enqueue_frontier` → `_copy_tables` | REACHES |
 | `MOJOTREES_GPU_TABLE_RESET` (five copies to one kernel) | `gpu_tree_tables.mojo` | REACHES | STRUCTURAL: `_device_search_resident` never opens the descriptor tables | REACHES |
 | `MOJOTREES_GPU_PACKED_DOWNLOAD` (six downloads to one) | `gpu_tree_tables.mojo` | REACHES | STRUCTURAL, same reason | REACHES |
-| `MOJOTREES_GPU_ROW_COMPACTION` | `gpu_active_rows.mojo:5910` | REACHES: `enqueue_desc_child` → `enqueue_desc_histogram` → `_ensure_compacted` | REACHES: `enqueue_leaf` → `enqueue_range_histogram` → `_ensure_compacted` | **SUSPECTED ACCIDENTAL.** The batched level build goes through `gpu_leaf_batching.enqueue_device_plan_batch_fused`, and `_ensure_compacted` has exactly two call sites, neither of them that one. Not fully traced; see the unverified list |
+| `MOJOTREES_GPU_ROW_COMPACTION` | `gpu_active_rows.mojo:5910` | REACHES: `enqueue_desc_child` → `enqueue_desc_histogram` → `_ensure_compacted` | REACHES: `enqueue_leaf` → `enqueue_range_histogram` → `_ensure_compacted` | **TRACED AND REFUSED, 2026-08-18. It was accidental, and it was not inert.** This cell read "SUSPECTED ACCIDENTAL ... Not fully traced". The trace holds, and the batched level build goes through `gpu_leaf_batching.enqueue_device_plan_batch_fused`, and `_ensure_compacted` still has exactly two call sites, neither of them that one. What the cell got wrong is the word inert. `GpuActiveRows` still MAINTAINED the compaction on this plane, one rebuild plus two launches a level, **13 command buffers on a depth-6 tree**, while 62 of the 63 histograms the tree builds read the dataset's own matrix. `oblivious_schedule_launches(6, 64, True)` is 55, and 55 + 13 is 68 against a 64-deep Metal queue that DOES NOT RAISE when overrun. So `histogram_gpu.GpuHistogramBuilder.stage_desc_level_plan` now **raises** on `self.rows.row_compaction_requested()`, once per tree. The missing consumer was also built, as `MOJOTREES_GPU_OBLIVIOUS_COMPACT_BINS`, and **measured 0.757x**; see `docs/design/DECLINED_OPTIMIZATIONS.md` C1 |
 | `MOJOTREES_GPU_HIST_STRATEGY`, `_MIN_TILES`, `_HIST_SPECIALIZATION` | `gpu_tiling.mojo`, `apple_histogram_policy.mojo` | REACHES | REACHES | partially: the batched level build resolves its own geometry |
 | `MOJOTREES_GPU_VERIFY_ROWS` | `train_gpu.mojo:1397` | STRUCTURAL, refused by name (`_check_verify_rows_reachable`) | REACHES, through `apply_split(expected_left=...)` | STRUCTURAL, refused by name |
 | `random_strength` device noise | `train_gpu.mojo`, `gpu_split_search.mojo` | REACHES | **WAS A HARD FAILURE.** Fixed; see below | REACHES |
@@ -263,10 +277,24 @@ that.
    four reader bodies survive over one variable. They agree, so this is a
    cleanup and not a hazard. Delete the alias with the two test lines, and turn
    the two in `gpu_resident_round` into delegations, in whichever order.
-3. `gpu_leaf_batching.mojo`. The batched level build appears not to go through
-   `GpuActiveRows._ensure_compacted`, which has two call sites and neither is
-   it, so `MOJOTREES_GPU_ROW_COMPACTION` would be inert on the symmetric plane
-   while reaching the other two. Confirm and classify.
+3. **CLOSED 2026-08-18, and the guess in it was half wrong.**
+   `gpu_leaf_batching.mojo`. This item read "The batched level build appears
+   not to go through `GpuActiveRows._ensure_compacted`, which has two call
+   sites and neither is it, so `MOJOTREES_GPU_ROW_COMPACTION` would be inert on
+   the symmetric plane while reaching the other two. Confirm and classify." It
+   was confirmed and classified. The two call sites are
+   `GpuActiveRows.enqueue_desc_histogram` and
+   `GpuActiveRows.enqueue_range_histogram`, and the level build still reaches
+   neither. **But it was never inert.** Arming the switch armed the
+   MAINTENANCE, which is one `_ensure_compacted` rebuild at the root build plus
+   the scatter and the copy-back from `_maintain_compaction` on every level's
+   descriptor partition, so 1 + 12 = 13 command buffers on a depth-6 tree,
+   collecting only the root build out of 63 histograms. Nothing consumes the
+   result and the queue overruns silently at 68 buffers against 64, so
+   `histogram_gpu.GpuHistogramBuilder.stage_desc_level_plan` now raises rather
+   than paying it. The missing consumer was separately built as
+   `MOJOTREES_GPU_OBLIVIOUS_COMPACT_BINS` and measured 0.757x, so it is not
+   coming back; `docs/design/DECLINED_OPTIMIZATIONS.md` row C1 holds the run.
 4. `gpu_tree_tables.mojo`, for whoever takes the depth-wise lift: a `min_depth`
    argument on the pick, and a level commit that admits per-leaf splits rather
    than one split per level.
@@ -302,6 +330,18 @@ that.
    where histogram construction is the reported 86 percent of a symmetric fit,
    that is a double-digit expectation, and expectations of that shape have been
    wrong here before (the row-tile floor).
-6. **Whether `MOJOTREES_GPU_ROW_COMPACTION` is inert on the symmetric plane.**
+6. **CLOSED 2026-08-18, and it never needed a compiler.** This item read
+   "Whether `MOJOTREES_GPU_ROW_COMPACTION` is inert on the symmetric plane.
    Traced to two `_ensure_compacted` call sites, neither in
-   `gpu_leaf_batching`, but the batched kernel's own bin source was not read.
+   `gpu_leaf_batching`, but the batched kernel's own bin source was not read."
+   The batched kernel's bin source has now been read.
+   `gpu_leaf_batching._batch_hist_atomic_kernel` and its subtracting twin
+   gather `bins[f * n_rows + rows[begin + j]]` from the dataset's own matrix
+   and have no other source, so the compacted planes are never consumed on this
+   plane. **The answer is that it is NOT inert.** It is worse than inert,
+   because it costs 13 command buffers a tree in maintenance nothing reads, and the total
+   of 68 overruns a 64-deep queue that reports nothing when overrun. It is now
+   a refusal in
+   `histogram_gpu.GpuHistogramBuilder.stage_desc_level_plan`. Reading source
+   settled every part of this, which is why it should not have sat on a list
+   headed "could not be verified without a compiler" for a day.

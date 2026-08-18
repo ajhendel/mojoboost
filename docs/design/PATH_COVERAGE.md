@@ -9,6 +9,18 @@ results file, from a docstring that records a measurement, or from
 `docs/design/DECLINED_OPTIMIZATIONS.md`, and its source is named in the cell.
 Everything else is a citation to a symbol.
 
+> **CORRECTED LATER ON 2026-08-18, and the correction is the most useful thing
+> in the file.** This document was read and written in the morning. In the
+> afternoon a lane finished the one half-built mechanism section 3A.1 named,
+> measured it a LOSS on real data, and deleted it and everything it touched
+> before the day was out. Section 3A's G-SYM compacted-bin cell, section 3A.1,
+> the `MOJOTREES_GPU_ROW_COMPACTION` cell in section 4, incident 1 in section 7
+> and ranked item 2 in section 8 all described the pre-removal world and are
+> edited in place, each saying what it used to say. Section 1 gained the
+> DELIBERATE strengths that let a measured loss be recorded as the closed cell
+> it is. **The lesson is not that the table was wrong. It is that a coverage
+> document ages in hours, so every cell names the symbol that settles it.**
+
 **Line numbers are not used.** This was read in a shared checkout with several
 lanes editing it, and two files moved under this read while it was open
 (`gpu_split_search.mojo` shifted a switch reader by 27 lines mid-session). Every
@@ -37,6 +49,27 @@ check it in one grep.
 recorded in source or in a design document. The reason is quoted or cited. A
 DELIBERATE cell is a **closed** question. Nobody needs to spend an afternoon on
 it, and re-opening it needs a new argument rather than a fresh reading.
+
+DELIBERATE has three strengths and the cell says which one it is, because
+"nobody carried it and here is why" and "somebody carried it and it lost" are
+not the same finding even though both are closed.
+
+- **DELIBERATE**, plain. A structural or stated reason, argued and never
+  built. `EFB bundled histogram` on the GPU bodies is this, refused by name at
+  `efb.check_bundling_honored`.
+- **DELIBERATE, and priced.** Built, measured, and came in a null. The arm was
+  then deleted and the cell records the ratio. The constant-hessian and
+  pre-quantized cells on G-SYM are this, at 1.016x and 1.018x.
+- **DELIBERATE, AND MEASURED NEGATIVE.** Built, measured, and came in a loss.
+  The compacted bin read on G-SYM is this, at 0.757x, and 3A.1 sets it out.
+
+**There is no separate "tried and lost" verdict and there should not be.** A
+fifth value would put the strongest closed cells in the table in a column of
+their own, next to the UNCARRIED ones, when what they are is the most closed
+thing this document can hold. An UNCARRIED cell means nobody has decided. A
+measured-negative cell means somebody built the mechanism, ran it, and the
+number decided. Running those two together would be the same error as running
+DELIBERATE and UNCARRIED together, one level in.
 
 **UNCARRIED.** The body does not execute the mechanism and **no reason is
 recorded anywhere this lane could find.** That is the output this file exists
@@ -143,48 +176,97 @@ tenth appears. See section 6.
 | **In-place subtraction, no per-node allocation** | HAS, `subtract_histogram_into` writes into a reused buffer | HAS, same | **UNCARRIED.** Calls `subtract_histogram`, whose body is `Histogram.zeroed(...)` then `subtract_histogram_into`. One full histogram allocated per split | **UNCARRIED**, same wrapper | N/A | N/A, device slots | N/A | N/A | **UNCARRIED**, same wrapper |
 | **Constant-hessian two-plane elision** | HAS, `const_hessian` argument threaded from `boosting.round_has_constant_hessian` | HAS, same argument, same grower call | **DELIBERATE.** `tree_sparse.grow_tree_sparse` states it, "the sparse accumulator has no three-plane elision to switch off", and carries the fields anyway so a future elision finds them in place | HAS, via `histogram_gpu.GpuHistogramBuilder.set_constant_hessian` forwarding to `GpuActiveRows` | HAS, same | HAS, same | HAS, same | **DELIBERATE, and priced.** The forward to the batcher was built behind `MOJOTREES_GPU_BATCH_CONST_HESS`, **measured 1.016x, a null**, and removed. `DECLINED_OPTIMIZATIONS.md` row E14. The kernel arm survives in `gpu_leaf_batching._batch_hist_atomic_kernel` and `GpuLeafBatcher.set_constant_hessian` has no caller, which its own docstring records | **UNCARRIED.** No `const_hessian` argument and no `set_constant_hessian` anywhere in `gpu_sparse.mojo`; `train_gpu_sparse` names `const_hessian_verify` only. The CPU sparse reason in the column three to the left may well transfer, and it is not written here |
 | **Pre-quantized gradient pair** | **DELIBERATE, refused by name.** `tree_parameters_extra.check_quantized_grad` raises on `use_quantized_grad=true`, "no trainer is wired to the quantized histogram in this build, so setting it would train a float model that silently ignored it". The accumulator exists at `quantized_gradient.build_histogram_subset_quantized_into_scratch` | DELIBERATE, same refusal, it fires above the policy fork | DELIBERATE, same refusal | HAS, `GpuActiveRows._ensure_quantized`, default ON via `MOJOTREES_GPU_QUANTIZED_GRADS` | HAS, same | HAS, same | HAS, same | **DELIBERATE, and priced.** Built behind `MOJOTREES_GPU_BATCH_QUANT`, **measured 1.018x, a null**, removed with its kernel and its buffer. `DECLINED_OPTIMIZATIONS.md` row E10, which ends "Do not rebuild it without a new reason" | N/A, own compressed accumulator |
-| **Compacted bin read, permutation-ordered matrix** | N/A | N/A | N/A | HAS, `enqueue_leaf` reaches `GpuActiveRows.enqueue_range_histogram` reaches `_ensure_compacted` | HAS, `_search_leaf_device` reaches the same chain | HAS, `enqueue_resident_leaf_subtracting` reaches the same chain | HAS, `enqueue_desc_child` reaches `GpuActiveRows.enqueue_desc_histogram` reaches `_ensure_compacted` | **UNCARRIED, AND HALF BUILT. See 3A.1** | N/A |
+| **Compacted bin read, permutation-ordered matrix** | N/A | N/A | N/A | HAS, `enqueue_leaf` reaches `GpuActiveRows.enqueue_range_histogram` reaches `_ensure_compacted` | HAS, `_search_leaf_device` reaches the same chain | HAS, `enqueue_resident_leaf_subtracting` reaches the same chain | HAS, `enqueue_desc_child` reaches `GpuActiveRows.enqueue_desc_histogram` reaches `_ensure_compacted` | **DELIBERATE, AND MEASURED NEGATIVE.** Built as `MOJOTREES_GPU_OBLIVIOUS_COMPACT_BINS`, **measured 0.757x on the device-MVS arm and 0.949x on the host-MVS one**, bit-identical models on both pairs, and removed the same day with its kernel scalar, its entry-point parameter and the compact-plane ping-pong it needed. `DECLINED_OPTIMIZATIONS.md` row C1. The level build now indexes the dataset's own matrix by row id and has no alternative. See 3A.1 | N/A |
 | **EFB bundled histogram** | HAS, `tree._expand_bundled` calls `efb.expand_bundled_histogram` | HAS, `_grow_oblivious_levels` takes the same `bundling: BundledMatrix` argument | HAS, `tree_sparse._node_histogram` calls the same | DELIBERATE, refused by name at `efb.check_bundling_honored`, called from `train_gpu` | DELIBERATE, same | DELIBERATE, same | DELIBERATE, same | DELIBERATE, same | DELIBERATE, refused by name at `train_gpu_sparse._refuse_bundling` |
 
 #### 3A.1. The compacted bin read on the symmetric device plane
 
-This cell is set out at length because it is the live instance of the whole
-defect class, and because `GROWTH_POLICY_REACH.md` left it as "SUSPECTED
-ACCIDENTAL, not fully traced". It is now traced.
+This cell is set out at length because it was the live instance of the whole
+defect class, because `GROWTH_POLICY_REACH.md` left it as "SUSPECTED
+ACCIDENTAL, not fully traced", and because it is now the only cell in this
+document that was closed by a number rather than by an argument. That file said
+so in three separate places and none of them was edited when this section first
+claimed to have traced it; all three are corrected as of 2026-08-18, so the two
+documents now agree at head.
 
-`GpuActiveRows` maintains `cbins`, a permutation-ordered copy of the bin matrix,
-and rebuilds it in `_ensure_compacted`. That function has exactly two call
-sites, `GpuActiveRows.enqueue_desc_histogram` and
+**AN EARLIER VERSION OF THIS SECTION SAID THE ARM WAS HALF BUILT AT HEAD AND
+ASKED SOMEBODY TO FINISH IT. That was true when this lane read the tree on
+2026-08-18 and false by the evening of the same day.** It is recorded here
+rather than quietly replaced, because a document that describes a repair as
+unfinished after the repair was built, measured and deleted is worse than one
+that never noticed. What the section used to hold was a list of the surviving
+halves. It named `gpu_leaf_batching.oblivious_compacted_bins_requested` with no
+call sites, a `compacted: Int32` launch scalar on `_batch_hist_atomic_kernel` and
+its subtracting twin, and a `compacted: Bool = False` parameter on
+`enqueue_device_plan_batch_fused` and `..._subtracting` that no caller passed.
+**None of those symbols exists now.** Grepping any of them returns prose only.
+
+**The reach was real.** `GpuActiveRows` maintains `cbins`, a
+permutation-ordered copy of the bin matrix, and rebuilds it in
+`_ensure_compacted`, which has exactly two call sites,
+`GpuActiveRows.enqueue_desc_histogram` and
 `GpuActiveRows.enqueue_range_histogram`. The symmetric device grower reaches
 neither. `grow_tree_device_oblivious` calls
 `histogram_gpu.GpuHistogramBuilder.enqueue_desc_level_children`, which calls
 `gpu_leaf_batching.GpuLeafBatcher.enqueue_device_plan_batch_fused` or its
-subtracting twin, and neither of those touches `GpuActiveRows` at all.
+subtracting twin, and neither of those touches `GpuActiveRows` at all. That
+trace is unchanged and still checks out at head.
 
-The repair was started and is not finished. At head there exist
+**The missing consumer was then built, and it lost.** A lane wired the dispatch
+half behind `MOJOTREES_GPU_OBLIVIOUS_COMPACT_BINS`, default off, pointing the
+level build at the permutation-ordered plane. Real data,
+`year_prediction_msd`, 463,715 x 90, 100 trees, symmetric depth 6, Apple M4,
+both arms interleaved inside ONE run, three repeats.
 
-- `gpu_leaf_batching.oblivious_compacted_bins_requested`, a switch reader for
-  `MOJOTREES_GPU_OBLIVIOUS_COMPACT_BINS` with a 60-line docstring, **and zero
-  call sites anywhere in `src/`, `tests/` or `bindings/`**;
-- a `compacted: Int32` launch scalar on `_batch_hist_atomic_kernel` and its
-  subtracting twin, with the `dense` branch fully written;
-- a `compacted: Bool = False` parameter on
-  `enqueue_device_plan_batch_fused` and
-  `enqueue_device_plan_batch_fused_subtracting`, **which no caller passes**.
+| arm | train s | ms per tree | model sha256 | ratio |
+|---|---|---|---|---|
+| host MVS, compact off | 6.009 | 60.09 | `2504284d1efa` | baseline |
+| host MVS, compact on | 6.329 | 63.29 | `2504284d1efa` | **0.949x** |
+| device MVS, compact off | 2.476 | 24.76 | `7614c64f8ca3` | baseline |
+| device MVS, compact on | 3.270 | 32.70 | `7614c64f8ca3` | **0.757x** |
 
-The switch's own docstring says it is "read once per level rather than per
-launch, at the one dispatch site (`GpuHistogramBuilder.enqueue_desc_level_children`)"
-and "conjoined with `GpuActiveRows.row_compaction_live()` at that site". Neither
-symbol appears in `histogram_gpu.mojo`. The kernel half landed and the dispatch
-half did not, which is the same shape as the original defect one layer in.
+**The models are bit-identical on both sides of each pair**, the same
+`file_sha256` within each MVS configuration, which is what the arm's own gate
+demanded. So the implementation was correct and it was simply slower, and it
+plainly engaged, because an arm that did nothing would have read 1.00x rather
+than 0.757x. The device-solve arm is the one the switch was aimed at, because
+that is where the level build is about 85 percent of the tree, and it is the
+arm that lost 24 percent. The lane's own registered refutation condition was
+met by more than its worst case, because it priced the maintenance at about
+5.8 ms per tree and the measured regression is 7.9 ms.
 
-Two qualifications, so this is not read as more than it is. First, the switch
-docstring itself prices the arm at 1.86x on the level build's **bin traffic**,
-not on the fit, and states plainly that the sign is the whole question. Second,
-`row_compaction_live()` requires the quantized gradient arm to be on, and on this
-plane the quantized arm is a **measured** decline (E10). So wiring the switch is
-not sufficient on its own, and that interaction is not mentioned in either
-docstring. This lane did not measure anything and does not claim the arm wins.
+**What this closes, beyond the cell.** The argument for the arm was that a
+strided row index makes a child's read of one feature cost a full column pass,
+so the level build was throwing away most of the bandwidth it consumed. If
+that had been true, removing the gather would have been a large win. It was a
+loss, so **the gather is not what the level build spends its time on**, and any
+future proposal resting on "the scattered bin read is the cost" is refuted in
+advance. `DECLINED_OPTIMIZATIONS.md` row C1 carries the full record and reads
+MEASURED NEGATIVE. Do not rebuild this arm on the old reasoning.
+
+**The two qualifications this section used to raise were both right, and
+neither is what killed it.** The switch's own docstring priced the arm at 1.86x
+on the level build's **bin traffic** rather than on the fit, and said the sign
+was the whole question; the sign came back negative. And `row_compaction_live()`
+requires the quantized gradient arm, which is a measured decline on this exact
+plane (E10), so wiring the switch was never going to be sufficient on its own.
+Recording that both cautions were correct is the cheap half of the lesson. The
+expensive half is that the estimate behind the arm was wrong in sign, not in
+size.
+
+**A latent bug the removal exposed, and it is now refused.** With the level
+read gone, nothing on the symmetric plane consumes a compacted plane except the
+root build, yet `MOJOTREES_GPU_ROW_COMPACTION=1` still armed the maintenance
+there, because `GpuActiveRows.__init__` reads that variable for every fit. An
+oblivious tree paid one rebuild plus two launches per level, 1 + 12 = 13
+command buffers, while 62 of the 63 histograms it builds read the dataset's own
+matrix. `gpu_resident_round.oblivious_schedule_launches(6, 64, True)` is 55,
+and 55 + 13 is 68 against a Metal queue that is 64 deep on the measured machine
+and **does not raise when it is overrun**. Since the failure mode is a silent
+overrun rather than a slow fit,
+`histogram_gpu.GpuHistogramBuilder.stage_desc_level_plan` now **raises** on
+`self.rows.row_compaction_requested()`, once per tree, off a host field. The
+switch does not reach this plane inertly. It errors.
 
 ### 3B. Split search and level scheduling
 
@@ -251,7 +333,7 @@ Five trainers, plus the two alternate boosting modes.
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | **Score update by leaf membership rather than tree traversal** | HAS, `boosting._leaf_score_update_enabled`, default ON | HAS, same, at `_boost_rounds_multiclass` and `train_multiclass_with_valid` | HAS, structurally and unconditionally. `tree_sparse.grow_tree_sparse` returns the row-to-leaf assignment, which `boosting_sparse._add_tree_scores` consumes | **UNCARRIED.** Adds `w * trees[s].predict_row(data, r)` per row per tree | **UNCARRIED.** Adds `trees[i].predict_row(data, row)` per row per tree | HAS, `histogram_gpu.GpuHistogramBuilder.update_raw_device` reaching `gpu_objectives_native.GpuObjectiveState.update_raw_ranges`, one launch over the leaf range table | **UNCARRIED. See 4.1** | HAS, `update_raw_device`, and also from `_train_multiclass_gpu_batched` | **UNCARRIED.** `raw[r] += params.learning_rate * tree.predict_row(data, r)` |
 | **Constant-hessian declaration** | HAS, `boosting.round_has_constant_hessian` | **DELIBERATE**, implied rather than stated at the site. `round_has_constant_hessian` opens "Whether a **single-output** round", and a softmax hessian is not constant. The reason is sound and it is not written where the multiclass loop is | DELIBERATE, the grower has no elision to switch off (3A) | not tabulated, `grow_tree` is shared | not tabulated | HAS, `builder.set_constant_hessian` in both `train_gpu` overloads | HAS, `builder.set_constant_hessian` in `train_gpu_with_valid` | DELIBERATE, same single-output argument | **DELIBERATE, stated at the site.** "No constant-hessian declaration on a custom objective ... the hessians here are whatever `grad_hess` returns" |
-| **Row compaction as an explicit parameter** | N/A | N/A | N/A | N/A | N/A | HAS, `row_compaction: Bool` argument on both `train_gpu` overloads | UNCARRIED as a parameter. The **switch** still reaches it, because `GpuActiveRows.__init__` reads `MOJOTREES_GPU_ROW_COMPACTION` itself, so this is an API asymmetry and not a lost optimization | UNCARRIED as a parameter, same | UNCARRIED as a parameter, same |
+| **Row compaction as an explicit parameter** | N/A | N/A | N/A | N/A | N/A | HAS, `row_compaction: Bool` argument on both `train_gpu` overloads | UNCARRIED as a parameter. The **switch** reaches it on the leaf-wise and depth-wise planes, because `GpuActiveRows.__init__` reads `MOJOTREES_GPU_ROW_COMPACTION` itself, so this is an API asymmetry and not a lost optimization. **Under `grow_policy=oblivious` neither route reaches it any more, because since 2026-08-18 `histogram_gpu.GpuHistogramBuilder.stage_desc_level_plan` raises on `self.rows.row_compaction_requested()`**, which is the field both the parameter and the variable set, so a symmetric fit that asks for compaction by either route errors rather than paying 13 launches a tree for one root build. See 3A.1 | UNCARRIED as a parameter, same | UNCARRIED as a parameter, same |
 | **Class batching, one launch across several classes** | N/A | **UNCARRIED at the trainer.** `gpu_multiclass_batch` is the GPU-side answer and has no CPU twin | N/A | N/A | N/A | N/A | N/A | Present but off by default. `gpu_output_planes.plan_class_batches` defaults to the sequential path "one class at a time, exactly what the trainer does today, until a caller or `MOJOTREES_GPU_CLASS_BATCH` asks for more" | N/A |
 | **Sibling subtraction inside the batched multiclass kernels** | N/A | N/A | N/A | N/A | N/A | N/A | N/A | **UNCARRIED.** No subtraction symbol appears anywhere in `gpu_multiclass_batch.mojo`. Every batched class builds both children | N/A |
 
@@ -382,7 +464,7 @@ would destroy the point of building any of it.
 
 | # | incident | table | checker | why |
 | --- | --- | --- | --- | --- |
-| 1 | `GpuActiveRows` compaction never read by the oblivious level build | **YES** | **YES** | It is a mechanism-against-body cell. Section 3A carries it, and it is **still open at head** in a half-built form section 3A.1 sets out. R2 records `_ensure_compacted` at two sites and would fire the moment a third appears |
+| 1 | `GpuActiveRows` compaction never read by the oblivious level build | **YES** | **YES** | It is a mechanism-against-body cell. Section 3A carries it. **Closed on 2026-08-18 by measurement.** The missing consumer was built, came in at 0.757x on the arm it was aimed at, and was deleted the same day, which is the outcome the table is for. Section 3A.1 sets it out. R2 records `_ensure_compacted` at two sites and would fire the moment a third appears |
 | 2 | Batched family missing the pre-quantized gradient and the constant-hessian elision | **YES** | partly | Two cells in section 3A. Both are DELIBERATE today, priced at 1.018x and 1.016x nulls by E10 and E14, which is precisely the outcome the table is for. R2 tracks `_ensure_quantized` and `set_constant_hessian` |
 | 3 | Oblivious predict walker had the branchless NaN identity, the flat walker kept the branch | **YES** | **NO** | A row in section 5, and it is the row marked NOT MECHANICALLY CHECKABLE. Inline arithmetic, no symbol. This is the honest limit of the mechanical half |
 | 4 | `noise_stage_parallel_requested` parallelized the draw and left the serial allocation and copy at both call sites | **NO** | **NO** | Both call sites are on the **same** path. The table's granularity is "does body B execute mechanism M", the cell would read HAS, and it would be right. The defect is partial implementation **inside** one cell, which is a different class and needs a different instrument |
@@ -405,7 +487,7 @@ sits under.** Where a figure appears it is a measurement of a *different*
 mechanism, quoted to say why the item is worth an afternoon, and it is labelled
 as such.
 
-Three items. The list is short on purpose.
+Three items. The list is short on purpose. **Item 2 closed on 2026-08-18, by measurement and against its own estimate**, and is kept in place and annotated rather than removed.
 
 ### 1. Terminal-child histogram builds on the host growers
 
@@ -435,29 +517,38 @@ elsewhere in this project as an oracle rather than an optimization target, which
 may be a sufficient reason to decline all three CPU cells. If it is, that reason
 belongs in the cell, and today the cell is empty.
 
-### 2. Finishing the compacted bin read on the symmetric device plane
+### 2. Finishing the compacted bin read on the symmetric device plane. CLOSED 2026-08-18, MEASURED NEGATIVE
+
+**Kept in the list rather than deleted from it, because the ranking is the
+record of how this was judged and a silently shortened list would not show that
+the item resolved, or how badly the estimate behind it read.**
 
 **Cell.** Section 3A.1. G-SYM.
 
-**The argument.** This is not "somebody should build a thing", it is "somebody
-built most of a thing and stopped". The kernel argument, the `dense` branch, the
-launch scalar, the entry-point parameter and a switch reader with a 60-line
-docstring all exist at head. What is missing is the dispatch site reading the
-switch and passing `compacted=True`, which the switch's own docstring specifies
-down to the conjunction with `row_compaction_live()`. The switch also specifies
-the measurement that closes it, one interleaved run at 463,715 by 90, and
-commits in advance to deleting itself either way under LANE_RULES rules 5 and 6.
+**What this item asked for.** It argued that "somebody built most of a thing
+and stopped", listed the kernel argument, the `dense` branch, the launch
+scalar, the entry-point parameter and a switch reader with a 60-line docstring
+as all existing at head, and asked for the one missing dispatch site. It ranked
+the item second because the cost to close was small and the outcome genuinely
+uncertain, and it noted that a half-built mechanism is strictly worse than
+either finishing it or deleting it.
 
-**Why I rank it second and not first.** The cost to close is small and the
-outcome is genuinely uncertain. The switch's own model prices it at 1.86x on the
-level build's **bin traffic** rather than on the fit, and `DECLINED_OPTIMIZATIONS.md`
-C1 prices the same trade at "somewhere between zero and +5.7 s" with the sign
-being the whole question. There is also an interaction neither docstring
-mentions, which is that `row_compaction_live()` requires the quantized gradient
-arm and that arm is a measured decline on this exact plane (E10). Wiring the
-switch may therefore not be sufficient. What makes it worth an afternoon is that
-a half-built mechanism is strictly worse than either finishing it or deleting
-it, and it has been sitting in the third state.
+**What happened.** The dispatch site was written the same day. The arm ran on
+the exact measurement the switch had committed itself to, one interleaved run
+at 463,715 x 90. It measured **0.757x on the device-MVS arm and 0.949x on the
+host-MVS one**, with bit-identical models on both sides of each pair. Every
+symbol listed above was deleted with it. `DECLINED_OPTIMIZATIONS.md` C1 reads
+MEASURED NEGATIVE and the numbers are in 3A.1.
+
+**What the item got right, and what it got wrong.** Right, that a half-built
+mechanism is the worst of the three states, and that the way out is a
+measurement rather than an opinion. It cost one afternoon and it is finished
+forever, which is what the ranking was for. Wrong, nothing in this item, nor in
+either docstring it quoted, nor in C1's own "somewhere between zero and +5.7 s"
+estimate, allowed for the sign being negative. The mechanism the whole estimate
+rested on, that the level build is bandwidth-bound on a strided bin read, is
+dead. **Do not re-rank this item on a fresh reading of the same source.** It
+needs a new mechanism, not a new afternoon.
 
 ### 3. The score update by tree traversal on four trainers
 

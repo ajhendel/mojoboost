@@ -53,9 +53,87 @@ at rather than resting on a line number.
 > Its predicate is still `== "1"` and its default is still off. A measured null
 > is not an unmeasured switch and its row now says which it is.
 
+> **UPDATED 2026-08-18.** Four changes. **(1)** Two switches were added to the
+> tree and have rows now, `MOJOTREES_PREDICT_TILE`, default **ON** and measured
+> (section 3L, a section this grid did not have), and
+> `MOJOTREES_BINNING_SORTED_TIE_REPAIR`, default off and unmeasured
+> (section 3I). **(2)** The `MOJOTREES_GPU_ROW_COMPACTION` row in section 3D
+> read `ALL GPU` and `CORRECTLY OFF, on a prediction rather than a
+> measurement`; both are wrong at head. It is now REFUSED under
+> `grow_policy=oblivious`, and the consumer it was waiting for was built and
+> measured a loss. The row says what it used to say. **(3)** Section 1's
+> reconciliation is recomputed, 90 to 108 raw hits and 85 to 86 live readers,
+> by the grep the section itself states. **(4)** Section 8 gains item 6, six
+> live switches that have no row here at all.
+>
+> **Two switches that existed earlier on 2026-08-18 are deliberately absent.**
+> `MOJOTREES_CPU_OVERSUBSCRIBE` was deleted because its fix became
+> unconditional, and `MOJOTREES_NOISE_DRAW_WEIGHT` was measured a null and
+> deleted (`DECLINED_OPTIMIZATIONS.md` E15). Neither gets a row. A grid row is
+> a promise that a reader can set the variable.
+
 ---
 
 ## 1. The population, and how it reconciles
+
+**RECOMPUTED 2026-08-18, by the method stated on the first line, which is the
+only reason the number could be moved at all.** The as-audited arithmetic on
+2026-08-17 is kept below it, because a reconciliation whose old value is
+discarded cannot be checked.
+
+    grep -rho 'MOJOTREES_[A-Z0-9_]*' src/ bindings/ | sort -u    -> 108 hits
+    names some code reads, as a quoted literal                   ->  86
+    prefix and docstring line-wrap fragments, not names          ->   4
+    a build-script shell variable, not a runtime switch          ->   1
+    tombstones: named in prose, no reader anywhere               ->  17
+                                                                     ---
+                                                                     108
+
+The 22 that are not real switches, by kind. A name counts as read when it
+appears somewhere under `src/` or `bindings/` as a double-quoted literal, which
+is what `getenv`, `_env_int` and a `comptime` alias all require and what prose
+never uses, since prose spells these in backticks.
+
+- **Four fragments.** `MOJOTREES_` the bare prefix, plus three line-wraps,
+  `MOJOTREES_GPU_SPLIT_`, `MOJOTREES_GPU_NOISE_STAGE_`, and
+  `MOJOTREES_DIST_`, the last of these from prose writing `MOJOTREES_DIST_*`.
+- **One shell variable.** `MOJOTREES_TARGET_FLAGS`.
+- **Seven distributed tombstones.** The `MOJOTREES_DIST_*` set of section 3K,
+  deleted 2026-08-17 and still named in `distributed_transport.mojo` prose that
+  records what was removed.
+- **Nine arm tombstones.** `MOJOTREES_GPU_GRAD_LAYOUT` and
+  `MOJOTREES_STARTUP_REPORT_FD` from the 2026-08-17 sweep;
+  `MOJOTREES_GPU_HIST_LEAN`, `MOJOTREES_GPU_HIST_PAIR_GRID` and
+  `MOJOTREES_GPU_HIST_PRIVATE`, geometry knobs on two accumulation kernels that
+  were built, measured bit-identical and null or worse on 2026-08-17, and
+  removed with their kernels (`DECLINED_OPTIMIZATIONS.md` rows E11 to E13);
+  `MOJOTREES_GPU_BATCH_QUANT` (E10, 1.018x null) and
+  `MOJOTREES_GPU_BATCH_CONST_HESS` (E14, 1.016x null); and, on 2026-08-18,
+  `MOJOTREES_GPU_OBLIVIOUS_COMPACT_BINS` (C1, 0.757x loss) and
+  `MOJOTREES_CPU_OVERSUBSCRIBE` (the fix became unconditional). **None of these
+  gets a row, and neither does `MOJOTREES_NOISE_DRAW_WEIGHT`**, which was
+  measured a null the same day (`DECLINED_OPTIMIZATIONS.md` E15) and deleted so
+  completely that it does not even survive in prose; it appears now only in
+  frozen `bench/real_data/` result artifacts. **A grid row for a name no code
+  reads is how a reader gets sent looking for a switch that is not there.**
+- **One foreign name.** `MOJOTREES_CATBOOST_MODE` is `bench`'s harness
+  variable, named once in `gpu_resident_round.mojo` prose. It configures a
+  benchmark arm, not a fit, and it is out of this grid's boundary for the same
+  reason `MOJOTREES_TARGET_FLAGS` is.
+
+**The drift is 18 raw hits and most of it predates 2026-08-18.** Nine names of
+it are the tombstone prose left behind by the 2026-08-17 deletions, which the
+old arithmetic counted as five specials and no tombstone class at all. The
+population of names code actually reads moved 85 to 86, which is the honest
+headline, two added this session (`MOJOTREES_PREDICT_TILE`,
+`MOJOTREES_BINNING_SORTED_TIE_REPAIR`), two deleted
+(`MOJOTREES_CPU_OVERSUBSCRIBE`, `MOJOTREES_NOISE_DRAW_WEIGHT`), one deleted the
+day before that the old count had already added
+(`MOJOTREES_GPU_OBLIVIOUS_COMPACT_BINS`), and `MOJOTREES_GPU_SKIP_TERMINAL_CHILDREN`
+added on 2026-08-17. **A grep count is not a switch count**, and treating the
+two as one number is what let 90 stand while the tree moved under it.
+
+The 2026-08-17 arithmetic, as audited, is preserved below.
 
     grep -rho 'MOJOTREES_[A-Z0-9_]*' src/ bindings/ | sort -u    ->  90 hits
     real switches that code reads                                ->  85
@@ -65,7 +143,7 @@ at rather than resting on a line number.
                                                                      ---
                                                                       90
 
-The five that are not real switches.
+The five that were not real switches then.
 
 | raw hit | what it actually is |
 |---|---|
@@ -80,12 +158,26 @@ call, in an `_env_int(name, default)` call, or as a `comptime` alias that a
 `getenv` then takes. Every one of the 85 was traced to the function that
 reads it.
 
-**The population has moved twice since, both on 2026-08-17, and the arithmetic
-above is the as-audited one.** Nine names were deleted (section 5) and one was
-added: `MOJOTREES_GPU_SKIP_TERMINAL_CHILDREN`, read by
-`train_gpu.skip_terminal_children_enabled`, which has a row in section 3B
-marked as postdating the grid. Re-derive the counts from the grep rather than
-from the table above if the exact number matters.
+Two of those five rows need a footnote at head.
+`MOJOTREES_STARTUP_REPORT_FD`'s row says "the prose line is now gone too"; the
+deleted line is gone, and `initialization.mojo` now carries a tombstone line
+that names the variable while recording its removal, which is why the grep
+still returns it. It is a tombstone rather than a reader, and it is counted as
+one in the recomputed arithmetic above. And the fragment class has gained a
+fourth member since, `MOJOTREES_DIST_`, from prose writing `MOJOTREES_DIST_*`
+in `distributed_transport.mojo`.
+
+**The population moved twice on 2026-08-17 and twice more on 2026-08-18, and
+the preserved arithmetic is the as-audited one.** On 2026-08-17 nine names were
+deleted (section 5) and one was added, `MOJOTREES_GPU_SKIP_TERMINAL_CHILDREN`,
+read by `train_gpu.skip_terminal_children_enabled`, which has a row in
+section 3B marked as postdating the grid. On 2026-08-18 two more were added,
+`MOJOTREES_PREDICT_TILE` (section 3L) and
+`MOJOTREES_BINNING_SORTED_TIE_REPAIR` (section 3I), and two were deleted after
+measurement, `MOJOTREES_CPU_OVERSUBSCRIBE` and `MOJOTREES_NOISE_DRAW_WEIGHT`.
+**The counts have been re-derived from the grep**, which is the recomputation
+at the top of this section; it is safe to move a number here only because the
+method that produces it is written down.
 
 An earlier audit, `bench/results/INSTRUCTION_AUDIT.md` section 9, works from a
 different population of 68. That list is `compatibility/api_snapshot.json`'s
@@ -197,7 +289,7 @@ GPU growth policy that constructs a builder, unless a row says otherwise.
 
 | name | read at | default | kind | reaches | measured? | verdict |
 |---|---|---|---|---|---|---|
-| `MOJOTREES_GPU_ROW_COMPACTION` | `GpuActiveRows.__init__`, `if _env_int("MOJOTREES_GPU_ROW_COMPACTION", 0) != 0: self.set_row_compaction(True)`. Also honored from `train_gpu`, `builder.rows.set_row_compaction(row_compaction or builder.rows.row_compaction_requested())` | unset behaves as off | PERFORMANCE | ALL GPU | **ASSERTED.** Order-preserving and bit-identical by construction. An arithmetic prediction in the lane brief puts it 1.7x to 2.5x underwater at 1M x 50, because partition touches 2.77 rows for every one the histogram touches. Never measured | CORRECTLY OFF, on a prediction rather than a measurement |
+| `MOJOTREES_GPU_ROW_COMPACTION` | `GpuActiveRows.__init__`, `if _env_int("MOJOTREES_GPU_ROW_COMPACTION", 0) != 0: self.set_row_compaction(True)`. Also honored from `train_gpu`, `builder.rows.set_row_compaction(row_compaction or builder.rows.row_compaction_requested())` | unset behaves as off | PERFORMANCE | **LEAF and DEPTH GPU. REFUSED on SYM since 2026-08-18**, and this cell read `ALL GPU`. `histogram_gpu.GpuHistogramBuilder.stage_desc_level_plan` raises on `self.rows.row_compaction_requested()`, which is the field BOTH the variable and the `row_compaction: Bool` parameter set, so neither route reaches an oblivious fit. The reason is not that it was inert there, because the level build consumes no compacted plane, so the arm paid one rebuild plus two launches a level, 13 command buffers on a depth-6 tree, collecting only the root build out of 63 histograms, and 55 + 13 = 68 overruns a 64-deep Metal queue that does not raise when overrun. See `docs/design/GROWTH_POLICY_REACH.md` and `docs/design/PATH_COVERAGE.md` 3A.1 | **MEASURED, INDIRECTLY, AND NEGATIVE.** This cell read "**ASSERTED.** ... Never measured" beside an arithmetic prediction of 1.7x to 2.5x underwater at 1M x 50. The compaction itself is still unmeasured end to end, but the consumer it was waiting for was built as `MOJOTREES_GPU_OBLIVIOUS_COMPACT_BINS` and run on real data, 463,715 x 90, 100 trees, symmetric depth 6, both arms interleaved in ONE run, **0.757x on the device-MVS arm and 0.949x on the host-MVS one**, bit-identical models on both pairs. `docs/design/DECLINED_OPTIMIZATIONS.md` row C1 reads MEASURED NEGATIVE. The prediction was right in sign | **CORRECTLY OFF, and now on a measurement.** Not "CORRECTLY OFF" in the ordinary sense, because on the symmetric plane it is not off, it is refused, and on the two leaf-shaped planes it stays off with the gather-is-the-cost argument for it now refuted by C1 |
 | `MOJOTREES_GPU_COMPACT_FLAG_READ` | same constructor, `self.compact_flag_read = _env_int("MOJOTREES_GPU_COMPACT_FLAG_READ", 0) != 0` | unset behaves as off | PERFORMANCE | ALL GPU, but **inert alone**. The comment states it, "inert on its own: it changes nothing at all unless the compaction arm above is also on" | **ASSERTED** | CORRECTLY OFF, and see section 7 |
 | `MOJOTREES_GPU_COMPACTION_TRACE` | `gpu_active_rows._compact_trace_sink`, `return getenv(COMPACTION_TRACE_VAR)` | unset behaves as off | DIAGNOSTIC | ALL GPU | n/a | DIAGNOSTIC |
 | `MOJOTREES_GPU_QUANTIZED_GRADS` | `GpuActiveRows.__init__`, `self.quantized_gradients = _env_int("MOJOTREES_GPU_QUANTIZED_GRADS", 1) != 0` | unset behaves as **ON** | PERFORMANCE | ALL GPU | **ASSERTED**, with an argument from the expression rather than a measurement. "Cannot change a histogram, only what the kernel gathers per row" | SHOULD BE THE DEFAULT (already is) |
@@ -278,6 +370,7 @@ optimized, so everything in 3H and 3I ranks below any GPU row.
 | `MOJOTREES_CPU_QUANT_SCALE` | `quantized_gradient.env_cpu_quant_scale_rule`, `if _env_int("MOJOTREES_CPU_QUANT_SCALE", 1) == 0: return SCALE_MAX_ABS`, else `SCALE_MAGNITUDE_SUM` | unset selects `SCALE_MAGNITUDE_SUM`, which matches the GPU lattice | **BEHAVIOR.** At the default "`num_grad_quant_bins` **does not affect the lattice**" | ALL CPU, quantized path only | **ASSERTED** | CORRECTLY OFF, it is a deliberate CPU/GPU-agreement tradeoff |
 | `MOJOTREES_LEAF_SCORE_UPDATE` | `boosting._leaf_score_update_enabled`, `return getenv("MOJOTREES_LEAF_SCORE_UPDATE") != "0"`; four consumers, `var by_leaf = _leaf_score_update_enabled()` | unset behaves as **ON** | PERFORMANCE | ALL CPU, and the GPU host-gradient round arms | **ASSERTED**, and stated as not a tuning knob, "there is no workload on which the traversal is the better route, and none has been measured either way" | SHOULD BE THE DEFAULT (already is) |
 | `MOJOTREES_BINNING_SELECT_MIN_ROWS` | `binning.env_select_min_rows`, `var n = _env_int("MOJOTREES_BINNING_SELECT_MIN_ROWS", SELECT_MIN_ROWS)`, non-positive falls back | unset selects `SELECT_MIN_ROWS` | CONFIGURATION | ALL, binning runs before growth | **ASSERTED**. "the two paths resolve the same order statistics, so this decides which one runs and nothing else" | NEEDS MEASURING, at low rank |
+| `MOJOTREES_BINNING_SORTED_TIE_REPAIR` **(ADDED TO THE TREE AFTER THIS GRID WAS BUILT, 2026-08-18)** | `binning.env_sorted_tie_repair`, `return getenv("MOJOTREES_BINNING_SORTED_TIE_REPAIR") == "1"` | unset behaves as off, "so the fit is instruction-for-instruction the fit it was" | PERFORMANCE | ALL, both backends. Binning runs above the policy fork, and it reaches only the tie-repair pass, which fires on the 59 of 90 columns of `year_prediction_msd` that have a tied boundary. A column the ascending probe rejects falls back to `resolve_above_unsorted`, so the switch measures nothing on data that does not sort | **UNMEASURED.** The docstring carries arithmetic and a bit-identity proof, not a run. 94.4 million mispredicting compares to repair 170 numbers, against 254 * 18 = 4,572 plus a 200,000-compare ascending probe, "about 350x less work in the repair". Bit-identity is proved rather than hoped, including the sign of zero, because on an array the probe has accepted the equal minima are contiguous | **NEEDS MEASURING.** The switch names the run that deletes it, one interleaved A/B of the binning phase on the 463,715 x 90 real cell, edges compared byte for byte. A win with identical edges makes it the only behavior and the variable goes; a loss, or one moved edge, deletes the code instead |
 
 ### 3J. Diagnostics with no policy specificity
 
@@ -313,6 +406,19 @@ Python distributed runtime uses a different, non-overlapping set of names
 (`MOJOTREES_DISTRIBUTED_BASE_PORT`, `MOJOTREES_DISTRIBUTED_CONNECT_TIMEOUT`,
 `MOJOTREES_DISTRIBUTED_PROVIDER`), so nothing bridges to these seven.
 
+### 3L. Prediction
+
+**A section this grid did not have.** `predict.mojo` reads three variables and
+none of them had a row anywhere above, which is a boundary error rather than a
+judgement. The grid's axes are growth policy and backend, and a batch walker
+has neither, so the walkers fell out of every section. Only the row this lane
+verified from source is filled in. `MOJOTREES_RAW_PREDICT` and
+`MOJOTREES_PREDICT_TRACE` are named in section 8 as still owed.
+
+| name | read at | default | kind | reaches | measured? | verdict |
+|---|---|---|---|---|---|---|
+| `MOJOTREES_PREDICT_TILE` **(ADDED TO THE TREE AFTER THIS GRID WAS BUILT, 2026-08-18)** | `predict.predict_tile_enabled`, `return getenv("MOJOTREES_PREDICT_TILE") != "0"`. Consumed in `predict.predict_raw_batch`, which holds the tiled closure and the `apply_row_major` one it replaced | **unset behaves as ON.** The `!= "0"` spelling this repository reserves for an arm that was argued, measured and shipped, and the variable is the escape hatch back to the row-outer nest | PERFORMANCE | **Scoring, not growth**, so all three policies and both backends reach it through the same walker. It is a loop interchange over the same trees, so it has no policy specificity at all. Not the GPU walker, which is `gpu_predict.GpuPredictor` and tiles by its own grid | **MEASURED, 2026-08-18**, and the docstring's own registered run is the one that was taken, one interleaved process on the real held-out split, 51,630 rows x 90 features, 100 trees, leaf-wise and depth-wise arms. **1.10x leaf-wise and 1.54x depth-wise, bit-identical** (`bench/results/RESUME_2026-08-18.md`). A loop interchange is a claim about the cache and nothing else, which is why an interleaved process rather than a before-build against an after-build | **SHOULD BE THE DEFAULT, AND IS SINCE 2026-08-18.** Flipped in the session that measured it, under LANE_RULES rule 5. The docstring at `predict_tile_enabled` still describes the measurement as owed rather than taken, which is **stale**; on the result it records, that function, the variable and the `apply_row_major` closure are all due for deletion |
+
 ---
 
 ## 4. Ranked candidates
@@ -334,6 +440,14 @@ Counts over the 85. By kind, CONFIGURATION 43, PERFORMANCE 25, DIAGNOSTIC 12,
 BEHAVIOR 5. By verdict, as the grid was built: CORRECTLY OFF 33, NEEDS
 MEASURING 14, SHOULD BE THE DEFAULT (already is) 14, DIAGNOSTIC 13, DEAD 8,
 SHOULD BE THE DEFAULT 3.
+
+**The verdict counts moved again on 2026-08-18.** `MOJOTREES_PREDICT_TILE`
+arrived already measured and already flipped, so it is a nineteenth default-ON
+switch and is NOT ranked below, for the same reason the other "already is" rows
+are not, which is that there is nothing to flip. `MOJOTREES_BINNING_SORTED_TIE_REPAIR`
+arrived unmeasured and is ranked 18. `MOJOTREES_GPU_ROW_COMPACTION` stays
+CORRECTLY OFF and unranked, but on a measurement now rather than on a
+prediction.
 
 **The verdict counts moved later on 2026-08-17 and the line above is the
 as-audited tally, kept for that reason.** All three SHOULD BE THE DEFAULT rows
@@ -362,6 +476,7 @@ on a measured null. The by-kind counts are unaffected; nothing changed kind.
 | 15 | `MOJOTREES_BINNING_SELECT_MIN_ROWS` | Unmeasured; it selects between two order-statistic paths that resolve the same answer | A binning-only timing at both paths on one matrix |
 | 16 | `MOJOTREES_GPU_WARMUP` | Unmeasured, and the documented way to exercise it is a pixi task that does not exist | A startup-latency capture at off, train and all. Note the harness gap first |
 | 17 | `MOJOTREES_CPU_FLOAT64_GATHER` | A real 12-passes-to-1 argument, and it **cannot affect a default fit**, because it is only reached under `derivative_precision=float64` and the shipped default is float32 | A float64 CPU fit, gather on against off. Last, because winning changes nothing that ships |
+| 18 | `MOJOTREES_BINNING_SORTED_TIE_REPAIR` **(ADDED 2026-08-18)** | Appended rather than inserted, so that ranks 1 to 17 keep the numbers other sections cite; by expected value it belongs beside rank 15, which is the other binning-phase item. 94.4 million mispredicting compares to repair 170 numbers on the real 463,715 x 90 cell, against 4,572 plus a 200,000-compare probe. The reason it is not higher is share, not size, because binning runs once per fit | The run the switch names, one interleaved A/B of the binning phase on that cell, with the fitted edges compared byte for byte. It deletes itself either way, the variable on a win with identical edges and the code on a loss or a moved edge |
 
 ---
 
@@ -547,7 +662,10 @@ check.
 The flag-read arm is stated to be "inert on its own: it changes nothing at all
 unless the compaction arm above is also on". `MOJOTREES_GPU_COMPACTION_TRACE`
 is the third member, and exists precisely so that "a requested-but-never-engaged
-arm is distinguishable from a working one".
+arm is distinguishable from a working one". **Since 2026-08-18 the pair cannot
+be set at all under `grow_policy=oblivious`**, because the compaction arm is
+refused there and the flag-read arm is inert without it, so the whole
+interaction is leaf-wise and depth-wise only.
 
 **F. `MOJOTREES_GPU_TRANSFER` plus `MOJOTREES_GPU_TRANSFER_UNPROVEN`.** The
 acknowledgment does nothing alone. It only changes an outcome when the route
@@ -650,7 +768,34 @@ Stated plainly, with what would have to be read to close each.
    open, so the answer is almost certainly yes; it was inferred from the
    constructor's placement rather than traced to a leaf-wise call site.
 
-6. **A conflict in `train_gpu.mojo`, RESOLVED 2026-08-17 in this grid's
+6. **SIX LIVE SWITCHES HAVE NO ROW IN THIS GRID, found 2026-08-18 by the
+   header's own claim to cover "every `MOJOTREES_*` environment switch under
+   `src/` and `bindings/`".** They are listed and NOT given rows, because this
+   lane verified only that each has a reader and did not trace its default,
+   kind, reach or evidence, and a half-filled row is worse than a named gap.
+
+   - `MOJOTREES_GPU_MVS_DEVICE`, `train_gpu.mojo`,
+     `getenv("MOJOTREES_GPU_MVS_DEVICE") == "1"`. The one that matters most.
+     The device MVS solve is measured at 2.23x oblivious, 3.23x leaf-wise and
+     2.97x depth-wise (`bench/results/RESUME_2026-08-18.md`), it is the arm the
+     C1 measurement was taken on both sides of, and it is spelled `== "1"`,
+     so a switch with three measured multiples behind it is off by default and
+     ungridded.
+   - `MOJOTREES_GPU_SEARCH_RESTAGE_HOIST`, `train_gpu.mojo`, `== "1"`.
+   - `MOJOTREES_GPU_FUSE_STEP_STAGE` and `MOJOTREES_GPU_FUSE_COPY_STEP`,
+     `gpu_resident_round.mojo`, both `== "1"` through
+     `comptime STEP_STAGE_FUSION_VAR` and `comptime COPY_STEP_FUSION_VAR`. The
+     comptime alias is why a name-level scan of `getenv` arguments misses them.
+   - `MOJOTREES_RAW_PREDICT` and `MOJOTREES_PREDICT_TRACE`, `predict.mojo`,
+     `!= "0"` and a trace sink. Section 3L exists now and is where they go.
+
+   **The shape of the miss is worth more than the list.** Four of the six are
+   on planes the grid's axes do name, and they were missed one at a time; two
+   are on the prediction walker, which no axis of this grid reaches, and they
+   were missed as a class. A grid whose header claims completeness needs the
+   grep in section 1 run against its own row set, not just against the tree.
+
+7. **A conflict in `train_gpu.mojo`, RESOLVED 2026-08-17 in this grid's
    favor.** As audited, two comments in `_grow_tree_gpu_device_search` said the
    `random_strength` line is "NOT REACHED BY ANY FIT TODAY" because
    `_check_device_search_supported` refuses `params.extra.is_active()`, while
