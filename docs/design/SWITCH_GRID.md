@@ -289,7 +289,7 @@ GPU growth policy that constructs a builder, unless a row says otherwise.
 
 | name | read at | default | kind | reaches | measured? | verdict |
 |---|---|---|---|---|---|---|
-| `MOJOTREES_GPU_ROW_COMPACTION` | `GpuActiveRows.__init__`, `if _env_int("MOJOTREES_GPU_ROW_COMPACTION", 0) != 0: self.set_row_compaction(True)`. Also honored from `train_gpu`, `builder.rows.set_row_compaction(row_compaction or builder.rows.row_compaction_requested())` | unset behaves as off | PERFORMANCE | **LEAF and DEPTH GPU. REFUSED on SYM since 2026-08-18**, and this cell read `ALL GPU`. `histogram_gpu.GpuHistogramBuilder.stage_desc_level_plan` raises on `self.rows.row_compaction_requested()`, which is the field BOTH the variable and the `row_compaction: Bool` parameter set, so neither route reaches an oblivious fit. The reason is not that it was inert there, because the level build consumes no compacted plane, so the arm paid one rebuild plus two launches a level, 13 command buffers on a depth-6 tree, collecting only the root build out of 63 histograms, and 55 + 13 = 68 overruns a 64-deep Metal queue that does not raise when overrun. See `docs/design/GROWTH_POLICY_REACH.md` and `docs/design/PATH_COVERAGE.md` 3A.1 | **MEASURED, INDIRECTLY, AND NEGATIVE.** This cell read "**ASSERTED.** ... Never measured" beside an arithmetic prediction of 1.7x to 2.5x underwater at 1M x 50. The compaction itself is still unmeasured end to end, but the consumer it was waiting for was built as `MOJOTREES_GPU_OBLIVIOUS_COMPACT_BINS` and run on real data, 463,715 x 90, 100 trees, symmetric depth 6, both arms interleaved in ONE run, **0.757x on the device-MVS arm and 0.949x on the host-MVS one**, bit-identical models on both pairs. `docs/design/DECLINED_OPTIMIZATIONS.md` row C1 reads MEASURED NEGATIVE. The prediction was right in sign | **CORRECTLY OFF, and now on a measurement.** Not "CORRECTLY OFF" in the ordinary sense, because on the symmetric plane it is not off, it is refused, and on the two leaf-shaped planes it stays off with the gather-is-the-cost argument for it now refuted by C1 |
+| `MOJOTREES_GPU_ROW_COMPACTION` | `GpuActiveRows.__init__`, `if _env_int("MOJOTREES_GPU_ROW_COMPACTION", 0) != 0: self.set_row_compaction(True)`. Also honored from `train_gpu`, `builder.rows.set_row_compaction(row_compaction or builder.rows.row_compaction_requested())` | unset behaves as off | PERFORMANCE | **LEAF and DEPTH GPU. REFUSED on SYM since 2026-08-18**, and this cell read `ALL GPU`. `histogram_gpu.GpuHistogramBuilder.stage_desc_level_plan` raises on `self.rows.row_compaction_requested()`, which is the field BOTH the variable and the `row_compaction: Bool` parameter set, so neither route reaches an oblivious fit. The reason is not that it was inert there, because the level build consumes no compacted plane, so the arm paid one rebuild plus two launches a level, 13 command buffers on a depth-6 tree, collecting only the root build out of 63 histograms. This cell then read "and 55 + 13 = 68 overruns a 64-deep Metal queue that does not raise when overrun"; **that clause is RETIRED, 2026-08-18** (section 6 item 8). The queue blocks the host when it is full rather than dropping work, and the leaf-wise plane runs 2,303 buffers a tree and is the fastest arm here, so 68 is a price and not an overrun. The 13 wasted buffers and the 0.757x measurement carry the refusal on their own. See `docs/design/GROWTH_POLICY_REACH.md` and `docs/design/PATH_COVERAGE.md` 3A.1 | **MEASURED, INDIRECTLY, AND NEGATIVE.** This cell read "**ASSERTED.** ... Never measured" beside an arithmetic prediction of 1.7x to 2.5x underwater at 1M x 50. The compaction itself is still unmeasured end to end, but the consumer it was waiting for was built as `MOJOTREES_GPU_OBLIVIOUS_COMPACT_BINS` and run on real data, 463,715 x 90, 100 trees, symmetric depth 6, both arms interleaved in ONE run, **0.757x on the device-MVS arm and 0.949x on the host-MVS one**, bit-identical models on both pairs. `docs/design/DECLINED_OPTIMIZATIONS.md` row C1 reads MEASURED NEGATIVE. The prediction was right in sign | **CORRECTLY OFF, and now on a measurement.** Not "CORRECTLY OFF" in the ordinary sense, because on the symmetric plane it is not off, it is refused, and on the two leaf-shaped planes it stays off with the gather-is-the-cost argument for it now refuted by C1 |
 | `MOJOTREES_GPU_COMPACT_FLAG_READ` | same constructor, `self.compact_flag_read = _env_int("MOJOTREES_GPU_COMPACT_FLAG_READ", 0) != 0` | unset behaves as off | PERFORMANCE | ALL GPU, but **inert alone**. The comment states it, "inert on its own: it changes nothing at all unless the compaction arm above is also on" | **ASSERTED** | CORRECTLY OFF, and see section 7 |
 | `MOJOTREES_GPU_COMPACTION_TRACE` | `gpu_active_rows._compact_trace_sink`, `return getenv(COMPACTION_TRACE_VAR)` | unset behaves as off | DIAGNOSTIC | ALL GPU | n/a | DIAGNOSTIC |
 | `MOJOTREES_GPU_QUANTIZED_GRADS` | `GpuActiveRows.__init__`, `self.quantized_gradients = _env_int("MOJOTREES_GPU_QUANTIZED_GRADS", 1) != 0` | unset behaves as **ON** | PERFORMANCE | ALL GPU | **ASSERTED**, with an argument from the expression rather than a measurement. "Cannot change a histogram, only what the kernel gathers per row" | SHOULD BE THE DEFAULT (already is) |
@@ -601,6 +601,60 @@ These are the column-5 findings that a name alone would not surface.
    fraction takes 63 draws per tree leaf-wise and 6 symmetric, so the two are
    not comparable across policies. Now stated in `_check_oblivious`'s own
    docstring as well.
+
+8. **THE 64-DEEP COMMAND QUEUE IS RETIRED AS A SAFETY CRITERION, 2026-08-18.**
+   Recorded here so the next lane does not re-derive it. A cluster of refusals
+   and docstrings in this repository argued that some arm was unsafe because it
+   would exceed a 64-deep Metal command queue. That argument is dead on this
+   repository's own evidence, in two independent ways, with a third defect
+   sitting on top of them. The three are different failures, so all three have
+   to be checked when the argument reappears.
+
+   **First, the queue is a throttle and not a cliff.**
+   `docs/GPU_PORTABILITY.md` 6.2 already established it.
+   `MTLCommandQueue.commandBuffer` BLOCKS the calling thread when the queue is
+   full rather than returning nil, so MAX's null check never fires and no error
+   is raised. The steady state is 64 launches in, the host blocked on the 65th
+   until the first completes, and one in and one out thereafter. Nothing is
+   dropped and nothing fails. "Overruns silently" describes nothing that
+   happens. Past 64 the cost is enqueue time, which the same measurement puts
+   at 6 to 7 microseconds under the knee and 14 to 17 over it, so the honest
+   form of the argument is a price per launch and never a gate.
+
+   **Second, the fastest arm this package ships runs far past the limit.** The
+   leaf-wise device-resident grower enqueues 8 + 9 * (num_leaves - 1) command
+   buffers per tree, which is 2,303 at `num_leaves = 256`. The host-step
+   profile at commit 1d77414 measured that arm backpressured, `device_wait` at
+   exactly 0 calls with `encode` at 85.74 percent of host time
+   (`bench/results/RESUME_2026-08-18.md`). So the repository refused one grower
+   at 63 to 73 launches on queue-depth grounds while routing the same fit to a
+   grower measured running five to thirty-six times past the same limit. Section
+   6.2 had already recorded the leaf-wise plane at "on the order of 315
+   launches between waits, which is nearly five times the depth", as a derived
+   bound; the profile is the measured version of it.
+
+   **Third, and separately, the depth-7 refusals cite a superseded function.**
+   `gpu_split_search.mojo` refuses depth 7 at "71 command buffers per tree,
+   over the queue's knee". 71 is `oblivious_launch_census(7)`, and that
+   function's own docstring says it models a schedule that does not exist yet
+   and is kept frozen as a registered prediction. The BUILT schedule is
+   `oblivious_schedule_launches`, and at head, under the shipped
+   `skip_last_build` and `OBLIVIOUS_MAX_ITEMS = 64`, it returns **63 at depth 7
+   and 73 at depth 8**. Depth 7 is under 64 on the schedule that actually runs
+   and is refused anyway, by a number the code stopped producing on 2026-08-17.
+   This is a distinct defect from the first two, a stale citation rather than a
+   bad model, and fixing one does not fix the other.
+
+   **What this does NOT do.** It converts no refusal into a permission. Every
+   refusal that rests on something other than the queue keeps standing on that
+   thing, and two in this grid do. `MOJOTREES_GPU_ROW_COMPACTION` under
+   oblivious (section 3D) is **correctly refused**, because its consumer was
+   built and **measured 0.757x**, a 24 percent LOSS, and because the arm pays
+   13 command buffers a tree that nothing on that plane reads; only its stated
+   reason was false. `OBLIVIOUS_MAX_LEAVES` is a compile-time threadgroup
+   allocation and binds whatever the queue does. A lane retiring the queue
+   argument at a site must say what the site's remaining reason is, and if
+   there is none, it owes a measurement before the refusal comes out.
 
 ---
 

@@ -37,7 +37,10 @@
 > `MOJOTREES_GPU_OBLIVIOUS_SKIP_LAST_BUILD` became the default and
 > `oblivious_schedule_launches(6, skip_last_build=True)` returns 55. Both counts
 > are under the 64-deep queue, so the kill criterion is answered either way, and
-> 56 stays quoted here as the all-off figure this paragraph was written about.) the six-launch gap is one record-filing phase per level that a level
+> 56 stays quoted here as the all-off figure this paragraph was written about.
+> **And since 2026-08-18 the criterion is retired**, so being under 64 is no
+> longer what admits the mode; see the blockquote below. The counts are
+> unchanged and still correct.) the six-launch gap is one record-filing phase per level that a level
 > does not need, and the census is deliberately left unedited. **The
 > `max_items >= 64` precondition is enforced rather than documented** -- a
 > builder holding the leaf-wise default of 32 refuses by name
@@ -52,6 +55,51 @@
 > Newton step is Float64 over Float64 sums and the device's is Float32 over
 > fixed-point Int32 sums. B4's "device vs host trees node-identical" should be
 > read that way. Nothing here is measured.
+
+> **THE QUEUE-DEPTH ARGUMENT IS RETIRED AS A SAFETY CRITERION, 2026-08-18.**
+> Every count below that reads "under 64" or "over 64" still counts correctly.
+> What is withdrawn is the idea that 64 is a boundary something breaks at, and
+> B5's first kill criterion, which made the whole mode conditional on landing
+> under it. Two independent findings retire it.
+>
+> **The queue is a throttle and not a cliff.** `docs/GPU_PORTABILITY.md` 6.2
+> establishes that `MTLCommandQueue.commandBuffer` BLOCKS the calling thread
+> when the queue is full rather than returning nil, so a tree that enqueues 68
+> buffers puts 64 in flight, blocks on the 65th until the first completes, and
+> then runs one in and one out. Nothing is dropped, nothing fails, and no error
+> is available to raise. Past 64 the cost is a throttled pipeline, priced in
+> per-launch enqueue time, which is a performance question and not a
+> correctness one.
+>
+> **The fastest arm this package ships runs thirty-six times past the limit.**
+> The leaf-wise device-resident grower enqueues 8 + 9 * (num_leaves - 1)
+> command buffers per tree, which is 2,303 at `num_leaves = 256`. The host-step
+> profile at commit 1d77414 measured that arm backpressured, `device_wait` at
+> exactly 0 calls and `encode` at 85.74 percent of host time
+> (`bench/results/RESUME_2026-08-18.md`). It is backpressured and it wins. So a
+> refusal of the symmetric plane at 63 to 73 launches, on the ground that 64 is
+> a limit, refuses one grower while routing the same fit to a grower measured
+> running five to thirty-six times past that same limit.
+>
+> **The counts quoted for depth 7 come from the wrong function.** The refusals
+> in `gpu_split_search.mojo` cite 71 command buffers at depth 7, which is
+> `oblivious_launch_census(7)`, and that function's own docstring says it
+> models a schedule that does not exist yet and is kept frozen as a registered
+> prediction. The BUILT schedule is `oblivious_schedule_launches`, and at head,
+> under the shipped `skip_last_build` and `OBLIVIOUS_MAX_ITEMS = 64`, it
+> returns **63 at depth 7 and 73 at depth 8**. Depth 7 is under 64 on the
+> schedule that runs and is refused anyway, by a number the code stopped
+> producing on 2026-08-17.
+>
+> **What survives.** Launch counts are still worth counting, because enqueue
+> cost has a measured knee at 64 and every launch past it is charged at roughly
+> double. Fusing a reduction into an existing launch is still the right shape.
+> And the refusals that rest on something other than the queue keep standing on
+> that other thing. `OBLIVIOUS_MAX_LEAVES` is a threadgroup allocation sized at
+> compile time, and row compaction under oblivious was **measured at 0.757x**,
+> a 24 percent loss (`docs/design/DECLINED_OPTIMIZATIONS.md` C1). Nothing here
+> converts a refusal into a permission. It removes one reason from a list and
+> leaves the priced ones in place.
 
 ## Part B. `grow_policy = oblivious`
 
@@ -147,6 +195,15 @@ GPU (resident plane, `gpu_resident_round.mojo`, `gpu_split_search.mojo`,
   oblivious level may cost more; and 64 is a knee (per-launch enqueue cost
   roughly doubles past it), not a wall, so the argument weakens rather than
   vanishes on the far side.
+  **Corrected 2026-08-18 on the depth-7 number, and the second caveat is now
+  the whole story.** Those five figures are `oblivious_launch_census`, the
+  frozen prediction, which by its own docstring models a schedule that does not
+  exist. The BUILT schedule is `oblivious_schedule_launches`, and at head, at
+  `OBLIVIOUS_MAX_ITEMS = 64` with the shipped `skip_last_build`, depth 7 is
+  **63** and depth 8 is **73**. So "d=7 is over either way" is false of the
+  code. It is also no longer a criterion. The knee is a price per launch and
+  the queue blocks rather than dropping, so being over it costs enqueue time
+  and breaks nothing; see the retirement blockquote above Part B.
 - Partition: every leaf by the same split; the device partition already
   handles a frontier; A1 (physical compaction) is where CatBoost's segmented
   sort would come in and is optional.
@@ -157,7 +214,12 @@ GPU (resident plane, `gpu_resident_round.mojo`, `gpu_split_search.mojo`,
   depth 6 that is 7 + 6 x 9 + 1 = 62, a derived bound of ~4.5x fewer
   launches, and it lands under the measured queue-depth knee of 64 command
   buffers, which is the real prize. (An earlier draft said ~6x from an
-  assumed 31 x 4 shape; superseded by the measured shape.)
+  assumed 31 x 4 shape; superseded by the measured shape.) **"The real prize"
+  is corrected 2026-08-18.** The prize is the 4.5x, which is host enqueue time
+  the fit no longer spends. Landing under 64 adds nothing on top of it, because
+  the queue throttles rather than failing and the leaf-wise plane runs 2,303
+  buffers a tree at `num_leaves = 256` and is the fastest arm here. Count
+  launches because each one costs; do not count them against a threshold.
 - Estimated size: two lanes (cross-leaf search; level schedule + partition),
   one lane to add the mode to the phase profile and the harness arms.
 
@@ -186,6 +248,20 @@ change our default); `random_strength` (A3) applies to all modes;
    command-buffer count under 64 (the measured queue-depth knee), the
    queue-depth argument evaporates and only the accuracy question remains.
    Settle this before any timing.
+
+   **WITHDRAWN 2026-08-18. This criterion was never a kill criterion.** It was
+   registered as one, and it was met, so nothing that shipped rests on it. It
+   is withdrawn rather than marked passed, because a criterion that would not
+   have killed anything must not be quoted at the next mode. Under 64 there is
+   no cliff to be on the safe side of. The Metal queue blocks the host when it
+   is full instead of dropping or failing, and the leaf-wise plane is measured
+   backpressured at 2,303 buffers a tree and is still the fastest arm this
+   package ships. What the census actually measures is enqueue cost, which
+   roughly doubles past the knee, so **the honest form of this item is a price
+   and not a gate**. State launches per tree, price them at the measured
+   per-launch enqueue cost on each side of 64, and put that number beside the
+   speed result. A mode that came in over 64 and faster would have been right
+   to ship.
 2. Accuracy: if, at equal end-to-end time on the M-series GPU, oblivious does
    not reach LightGBM leaf-wise accuracy within thresholds on the real-data
    set (and is not within thresholds of CatBoost defaults), it stays opt-in

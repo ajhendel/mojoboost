@@ -79,7 +79,7 @@ it, which is a defect.
 | `MOJOTREES_GPU_SPLIT_TABLE_PACK` (four uploads to one) | `gpu_split_search.mojo` | REACHES | REACHES via `enqueue_frontier` → `_copy_tables` | REACHES |
 | `MOJOTREES_GPU_TABLE_RESET` (five copies to one kernel) | `gpu_tree_tables.mojo` | REACHES | STRUCTURAL: `_device_search_resident` never opens the descriptor tables | REACHES |
 | `MOJOTREES_GPU_PACKED_DOWNLOAD` (six downloads to one) | `gpu_tree_tables.mojo` | REACHES | STRUCTURAL, same reason | REACHES |
-| `MOJOTREES_GPU_ROW_COMPACTION` | `gpu_active_rows.mojo:5910` | REACHES: `enqueue_desc_child` → `enqueue_desc_histogram` → `_ensure_compacted` | REACHES: `enqueue_leaf` → `enqueue_range_histogram` → `_ensure_compacted` | **TRACED AND REFUSED, 2026-08-18. It was accidental, and it was not inert.** This cell read "SUSPECTED ACCIDENTAL ... Not fully traced". The trace holds, and the batched level build goes through `gpu_leaf_batching.enqueue_device_plan_batch_fused`, and `_ensure_compacted` still has exactly two call sites, neither of them that one. What the cell got wrong is the word inert. `GpuActiveRows` still MAINTAINED the compaction on this plane, one rebuild plus two launches a level, **13 command buffers on a depth-6 tree**, while 62 of the 63 histograms the tree builds read the dataset's own matrix. `oblivious_schedule_launches(6, 64, True)` is 55, and 55 + 13 is 68 against a 64-deep Metal queue that DOES NOT RAISE when overrun. So `histogram_gpu.GpuHistogramBuilder.stage_desc_level_plan` now **raises** on `self.rows.row_compaction_requested()`, once per tree. The missing consumer was also built, as `MOJOTREES_GPU_OBLIVIOUS_COMPACT_BINS`, and **measured 0.757x**; see `docs/design/DECLINED_OPTIMIZATIONS.md` C1 |
+| `MOJOTREES_GPU_ROW_COMPACTION` | `gpu_active_rows.mojo:5910` | REACHES: `enqueue_desc_child` → `enqueue_desc_histogram` → `_ensure_compacted` | REACHES: `enqueue_leaf` → `enqueue_range_histogram` → `_ensure_compacted` | **TRACED AND REFUSED, 2026-08-18. It was accidental, and it was not inert.** This cell read "SUSPECTED ACCIDENTAL ... Not fully traced". The trace holds, and the batched level build goes through `gpu_leaf_batching.enqueue_device_plan_batch_fused`, and `_ensure_compacted` still has exactly two call sites, neither of them that one. What the cell got wrong is the word inert. `GpuActiveRows` still MAINTAINED the compaction on this plane, one rebuild plus two launches a level, **13 command buffers on a depth-6 tree**, while 62 of the 63 histograms the tree builds read the dataset's own matrix. `oblivious_schedule_launches(6, 64, True)` is 55, and 55 + 13 is 68. **THE QUEUE HALF OF THAT SENTENCE IS RETIRED, 2026-08-18.** It read "68 against a 64-deep Metal queue that DOES NOT RAISE when overrun", and the reason it does not raise is that there is nothing to raise about. `MTLCommandQueue.commandBuffer` BLOCKS the calling thread when the queue is full rather than returning nil (`docs/GPU_PORTABILITY.md` 6.2), so 68 buffers means 64 in flight and 4 more admitted one at a time as older ones retire. Nothing is dropped and nothing fails. The counterexample is in this package. The leaf-wise device-resident grower enqueues 8 + 9 * (num_leaves - 1) buffers a tree, 2,303 at `num_leaves = 256`, and the host-step profile at 1d77414 measured it backpressured, `device_wait` at exactly 0 calls with `encode` at 85.74 percent of host time, and it is the fastest arm this package ships. **The refusal stands, on cost rather than on safety.** `histogram_gpu.GpuHistogramBuilder.stage_desc_level_plan` still **raises** on `self.rows.row_compaction_requested()`, once per tree, because the arm pays 13 command buffers of maintenance a tree that nothing on this plane reads, and because the consumer that would have read them was built as `MOJOTREES_GPU_OBLIVIOUS_COMPACT_BINS` and **measured 0.757x**, a 24 percent LOSS; see `docs/design/DECLINED_OPTIMIZATIONS.md` C1. The measurement is now the whole reason |
 | `MOJOTREES_GPU_HIST_STRATEGY`, `_MIN_TILES`, `_HIST_SPECIALIZATION` | `gpu_tiling.mojo`, `apple_histogram_policy.mojo` | REACHES | REACHES | partially: the batched level build resolves its own geometry |
 | `MOJOTREES_GPU_VERIFY_ROWS` | `train_gpu.mojo:1397` | STRUCTURAL, refused by name (`_check_verify_rows_reachable`) | REACHES, through `apply_split(expected_left=...)` | STRUCTURAL, refused by name |
 | `random_strength` device noise | `train_gpu.mojo`, `gpu_split_search.mojo` | REACHES | **WAS A HARD FAILURE.** Fixed; see below | REACHES |
@@ -290,9 +290,14 @@ that.
    the scatter and the copy-back from `_maintain_compaction` on every level's
    descriptor partition, so 1 + 12 = 13 command buffers on a depth-6 tree,
    collecting only the root build out of 63 histograms. Nothing consumes the
-   result and the queue overruns silently at 68 buffers against 64, so
-   `histogram_gpu.GpuHistogramBuilder.stage_desc_level_plan` now raises rather
-   than paying it. The missing consumer was separately built as
+   result. **The clause "and the queue overruns silently at 68 buffers against
+   64" is RETIRED, 2026-08-18**, on two grounds. The Metal queue blocks the
+   host when it is full instead of dropping anything, so there is no overrun to
+   be silent about (`docs/GPU_PORTABILITY.md` 6.2), and the leaf-wise plane
+   runs 2,303 buffers a tree at `num_leaves = 256`, measured backpressured, and
+   is the fastest arm here. `histogram_gpu.GpuHistogramBuilder.stage_desc_level_plan`
+   raises anyway, on the 13 wasted command buffers and on the measurement below
+   rather than on a safety bound. The missing consumer was separately built as
    `MOJOTREES_GPU_OBLIVIOUS_COMPACT_BINS` and measured 0.757x, so it is not
    coming back; `docs/design/DECLINED_OPTIMIZATIONS.md` row C1 holds the run.
 4. `gpu_tree_tables.mojo`, for whoever takes the depth-wise lift: a `min_depth`
@@ -339,9 +344,13 @@ that.
    gather `bins[f * n_rows + rows[begin + j]]` from the dataset's own matrix
    and have no other source, so the compacted planes are never consumed on this
    plane. **The answer is that it is NOT inert.** It is worse than inert,
-   because it costs 13 command buffers a tree in maintenance nothing reads, and the total
-   of 68 overruns a 64-deep queue that reports nothing when overrun. It is now
-   a refusal in
+   because it costs 13 command buffers a tree in maintenance nothing reads.
+   This item also said "and the total of 68 overruns a 64-deep queue that
+   reports nothing when overrun". **That clause is RETIRED, 2026-08-18.** The
+   queue blocks the host rather than overrunning, and the leaf-wise plane runs
+   2,303 buffers a tree and wins, so 68 is a price and not a fault. The 13
+   wasted buffers are the whole cost and they are enough to refuse it. It is
+   now a refusal in
    `histogram_gpu.GpuHistogramBuilder.stage_desc_level_plan`. Reading source
    settled every part of this, which is why it should not have sat on a list
    headed "could not be verified without a compiler" for a day.

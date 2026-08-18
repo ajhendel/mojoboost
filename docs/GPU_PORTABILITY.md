@@ -476,6 +476,29 @@ completes, and thereafter the stream runs at one in and one out. That is a
 throttled pipeline and not a queue overrun. Nothing is dropped and nothing
 fails. No one has measured it on this hardware.
 
+**Measured 2026-08-18, and the last sentence above is superseded.** The
+host-step profile at commit 1d77414, leaf-wise arm, 463,715 x 90, 100 trees,
+recorded `device_wait` at exactly 0 calls and 0 ns, `encode` at 85.74 percent
+of host time, a 25.8 ms maximum step against a 0.13 ms mean, and a step curve
+that runs cheap for six steps and then plateaus
+(`bench/results/RESUME_2026-08-18.md`). That is the derived steady state,
+observed, and the block lands in the encode column exactly where the paragraph
+above says it will. Two things follow that the derivation alone did not give.
+The stall is now the dominant term in host time on that arm, which is why no
+host-side optimization has moved any arm's wall clock. And **the arm that runs
+backpressured is the fastest one this package ships**. The leaf-wise
+device-resident grower enqueues 8 + 9 * (num_leaves - 1) command buffers a
+tree, which is 2,303 at `num_leaves = 256`, thirty-six times the depth.
+
+**The queue depth is therefore retired as a safety criterion, 2026-08-18.** It
+is a price per launch, 6 to 7 microseconds under it and 14 to 17 over it, and a
+count that stays worth counting. It is not a limit an arm can be unsafe past.
+Refusals elsewhere in this repository that read "overruns a 64-deep queue that
+does not raise when overrun" are answered by this section twice over. The queue
+does not raise because there is nothing to raise about, and the arm that runs
+furthest past the depth is the one that wins. `docs/design/SWITCH_GRID.md`
+section 6 item 8 carries the retirement and the list of sites.
+
 **The stall is invisible to every instrument in this repository.** The block
 happens inside `objc_msgSend`, which `phase_profile.mojo`, `PhaseCounters`
 in `gpu_runtime.mojo`, and any wall-clock benchmark all count as host enqueue
@@ -510,7 +533,9 @@ the block occurs, not observed.
    blocked, and the two call for opposite fixes.
 2. **Bound any "N launches with no host wait" claim at 64 on Metal, and say
    so in the same sentence.** The claim is still worth making. It is the
-   count that has to be honest.
+   count that has to be honest. This is a rule about what a claim may say,
+   **not a rule about what a design may enqueue.** Read as the second, it
+   produced a run of refusals this section does not support; see rule 5.
 3. **Compose the two facts before counting.** A copy in the middle of a
    launch stream drains the queue, so the usable depth is not 64 launches
    per tree, it is 64 launches between copies. A per-round upload resets the
@@ -524,6 +549,16 @@ the block occurs, not observed.
    that sentence was derived from a symbol table when it was written; it has
    since been **verified by execution** and the raise it produces is quoted
    in section 6.5.
+5. **Never refuse an arm because it exceeds 64. Price it instead.** Added
+   2026-08-18. A launch count over the depth costs enqueue time at the
+   measured knee and costs nothing else, so a refusal written on queue-depth
+   grounds is refusing on a criterion this section does not provide. If the
+   arm should be refused, the reason is a measurement or a hard resource such
+   as a compile-time threadgroup allocation, and the refusal must name that
+   reason instead. Two further traps are live in this repository on 2026-08-18.
+   One is a count quoted from a frozen prediction function rather than from the
+   schedule the code enqueues. The other is a refusal applied to one grower
+   while the fit is routed to another grower running far deeper.
 
 ### 6.3 What each backend provides, on these two points
 
