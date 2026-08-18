@@ -3526,6 +3526,52 @@ def _softmax_inplace(mut scores: List[Float64], start: Int, k: Int):
         scores[start + i] /= total
 
 
+def _softmax_rows(
+    raw: List[Float64],
+    mut prob: List[Float64],
+    n: Int,
+    n_classes: Int,
+    settings: DispatchSettings = DispatchSettings.unresolved(),
+) raises:
+    """Row-major softmax of `raw` into `prob`, dispatched over rows.
+
+    Split out of the two multiclass round loops on 2026-08-18 so it could
+    reach the pool. It is the round's only whole-dataset transcendental pass
+    and it was the last serial one on the multiclass path.
+
+    Elementwise across rows: row `r` touches `[r * n_classes, (r + 1) *
+    n_classes)` in both arrays and nothing else, so the answer cannot depend
+    on how rows are grouped into tasks. The body is `_softmax_inplace`
+    written against a pointer rather than a `List`, because a closure cannot
+    take a `mut List` argument.
+    """
+    var rp = raw.unsafe_ptr()
+    var pp = prob.unsafe_ptr()
+
+    def block(start: Int, end: Int) {imm}:
+        for r in range(start, end):
+            var base = r * n_classes
+            for i in range(n_classes):
+                pp.unsafe_store(base + i, rp.unsafe_load(base + i))
+            var m = pp.unsafe_load(base)
+            for i in range(1, n_classes):
+                var v = pp.unsafe_load(base + i)
+                if v > m:
+                    m = v
+            var total = 0.0
+            for i in range(n_classes):
+                var e = exp(pp.unsafe_load(base + i) - m)
+                pp.unsafe_store(base + i, e)
+                total += e
+            for i in range(n_classes):
+                pp.unsafe_store(base + i, pp.unsafe_load(base + i) / total)
+
+    # A row here is `n_classes` exponentials, far more than the handful of
+    # flops `elementwise_row_ops` is calibrated for, so the estimate is scaled
+    # by the class count rather than taken flat.
+    dispatch_rows_with(settings, block, n, elementwise_row_ops(n) * n_classes)
+
+
 def _fill_softmax_grad_hess(
     prob: List[Float64],
     labels: List[Int],
@@ -3535,6 +3581,7 @@ def _fill_softmax_grad_hess(
     mut grad: List[Float64],
     mut hess: List[Float64],
     float64_derivatives: Bool = False,
+    settings: DispatchSettings = DispatchSettings.unresolved(),
 ) raises:
     """One-vs-rest gradients and hessians for class `k` from row-major
     softmax probabilities.
@@ -3563,11 +3610,11 @@ def _fill_softmax_grad_hess(
     check_derivative_precision()
     if derivative_precision_narrows() and not float64_derivatives:
         _fill_softmax_grad_hess_at[True](
-            prob, labels, k, n_classes, weights, grad, hess
+            prob, labels, k, n_classes, weights, grad, hess, settings
         )
     else:
         _fill_softmax_grad_hess_at[False](
-            prob, labels, k, n_classes, weights, grad, hess
+            prob, labels, k, n_classes, weights, grad, hess, settings
         )
 
 
@@ -3581,27 +3628,53 @@ def _fill_softmax_grad_hess_at[
     weights: List[Float64],
     mut grad: List[Float64],
     mut hess: List[Float64],
-):
-    """`_fill_softmax_grad_hess` at one derivative precision."""
+    settings: DispatchSettings = DispatchSettings.unresolved(),
+) raises:
+    """`_fill_softmax_grad_hess` at one derivative precision.
+
+    **PARALLEL AND PRE-SIZED SINCE 2026-08-18, and it was neither before.**
+    This ran as a serial `append` loop while the single-output twin
+    `_fill_grad_hess_into` had written through `unsafe_ptr` under
+    `dispatch_rows_with` for a long time. The parallel fill was structurally
+    unreachable from multiclass, because this function took no
+    `DispatchSettings` to reach it with.
+
+    That cost more than it looks. A softmax round fills derivatives once PER
+    CLASS, so covertype paid 7 serial passes over 464,958 rows every round,
+    700 passes a fit, with two `List.append` per row and the `len(weights)`
+    test re-evaluated inside the row loop.
+
+    **Bit-identical by construction, not by measurement.** Every row's
+    gradient and hessian is a function of that row alone, so the map is
+    elementwise: no reduction, no cross-row order, nothing a task boundary
+    can reassociate. The stores land at the same indices the appends did.
+    """
+    var n = len(labels)
     grad.clear()
     hess.clear()
+    grad.resize(unsafe_uninit_length=n)
+    hess.resize(unsafe_uninit_length=n)
     var factor = Float64(n_classes) / Float64(n_classes - 1)
-    for r in range(len(labels)):
-        var p = prob[r * n_classes + k]
-        var y = 1.0 if labels[r] == k else 0.0
-        var w = weights[r] if len(weights) > 0 else 1.0
-        grad.append(derivative[NARROW](w * (p - y)))
-        # LightGBM softmax hessian: (k / (k - 1)) * p * (1 - p), floored
-        # (multiclass_objective.hpp, factor_). At two classes the factor is
-        # 2, which is where the old hardcoded 2.0 came from; at seven
-        # classes the true factor is 7/6, and the overscaled hessian shrank
-        # every leaf by ~1.7x — the real-data harness caught it as a 14%
-        # multi_logloss gap on covertype. XGBoost's max(2p(1-p), eps) is a
-        # different convention, not this one.
-        var h = factor * p * (1.0 - p)
-        if h < 1e-16:
-            h = 1e-16
-        hess.append(derivative[NARROW](w * h))
+    # Hoisted: it was re-tested once per row, and it is a property of the fit.
+    var weighted = len(weights) > 0
+    var gp = grad.unsafe_ptr()
+    var hp = hess.unsafe_ptr()
+    var pp = prob.unsafe_ptr()
+    var lp = labels.unsafe_ptr()
+    var wp = weights.unsafe_ptr()
+
+    def block(start: Int, end: Int) {imm}:
+        for r in range(start, end):
+            var p = pp.unsafe_load(r * n_classes + k)
+            var y = 1.0 if lp.unsafe_load(r) == k else 0.0
+            var w = wp.unsafe_load(r) if weighted else 1.0
+            gp.unsafe_store(r, derivative[NARROW](w * (p - y)))
+            var h = factor * p * (1.0 - p)
+            if h < 1e-16:
+                h = 1e-16
+            hp.unsafe_store(r, derivative[NARROW](w * h))
+
+    dispatch_rows_with(settings, block, n, elementwise_row_ops(n))
 
 
 def _multiclass_goss_select(
@@ -3959,10 +4032,13 @@ def _boost_rounds_multiclass(
     for i in range(params.n_estimators):
         var round = round_offset + i
         refresh_bag(bag, bagging, n, round)
-        for r in range(n):
-            for k in range(n_classes):
-                prob[r * n_classes + k] = raw[r * n_classes + k]
-            _softmax_inplace(prob, r * n_classes, n_classes)
+        # PARALLEL SINCE 2026-08-18. This was a serial loop doing `n_classes`
+        # `exp()` per row: 3.25 M exponentials a round on covertype, 325 M a
+        # fit, on one core, while the rest of the round used the pool. A row's
+        # softmax reads and writes only that row's K slots, so the map is
+        # elementwise across rows and a task boundary cannot reassociate
+        # anything. Bit-identical by construction.
+        _softmax_rows(raw, prob, n, n_classes, settings)
 
         # One shared sample for the whole round, drawn before any class's
         # tree so that every class is grown on the same rows.
@@ -4384,10 +4460,13 @@ def train_multiclass_with_valid(
     var by_leaf = _leaf_score_update_enabled()
     for i in range(params.n_estimators):
         refresh_bag(bag, bagging, n, i)
-        for r in range(n):
-            for k in range(n_classes):
-                prob[r * n_classes + k] = raw[r * n_classes + k]
-            _softmax_inplace(prob, r * n_classes, n_classes)
+        # PARALLEL SINCE 2026-08-18. This was a serial loop doing `n_classes`
+        # `exp()` per row: 3.25 M exponentials a round on covertype, 325 M a
+        # fit, on one core, while the rest of the round used the pool. A row's
+        # softmax reads and writes only that row's K slots, so the map is
+        # elementwise across rows and a task boundary cannot reassociate
+        # anything. Bit-identical by construction.
+        _softmax_rows(raw, prob, n, n_classes, settings)
 
         # One shared sample for the whole round, drawn before any class's
         # tree so that every class is grown on the same rows.
