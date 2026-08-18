@@ -186,6 +186,11 @@ pandas = "*"
 # record that states defaults nobody checked is worse than one that states
 # none. See bench/real_data/scenarios.py, CATBOOST_MIN_VERSION.
 catboost = ">=1.2"
+# NVIDIA's gbm-bench imports tqdm at module scope in datasets.py for a
+# download progress bar. bench/external/ runs that harness unmodified
+# apart from three anchored edits, so the dependency is declared here
+# rather than stubbed out. See bench/external/README.md.
+tqdm = "*"
 # The XGBoost peer arm of bench/real_data, added 2026-08-17. It is a peer
 # column reported beside the comparator and never instead of it, exactly as
 # catboost is: the one comparator is LightGBM at stock defaults plus

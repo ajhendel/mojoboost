@@ -1,0 +1,36 @@
+{
+  "year": {
+    "lgbm-cpu": {
+      "accuracy": {
+        "MeanAbsError": 6.232379213956986,
+        "MeanSquaredError": 79.79054192120225,
+        "MedianAbsError": 4.253684370623205
+      },
+      "train_time": 28.940627624979243
+    },
+    "lgbm-cpu-det": {
+      "accuracy": {
+        "MeanAbsError": 6.232379213956986,
+        "MeanSquaredError": 79.79054192120225,
+        "MedianAbsError": 4.253684370623205
+      },
+      "train_time": 29.256649833056144
+    },
+    "mojotrees-cpu": {
+      "accuracy": {
+        "MeanAbsError": 6.241748247585207,
+        "MeanSquaredError": 80.27655513866227,
+        "MedianAbsError": 4.269453427288795
+      },
+      "train_time": 49.036523165996186
+    },
+    "mojotrees-gpu": {
+      "accuracy": {
+        "MeanAbsError": 6.22685076519748,
+        "MeanSquaredError": 79.99671442534583,
+        "MedianAbsError": 4.259086590344168
+      },
+      "train_time": 34.40689058392309
+    }
+  }
+}

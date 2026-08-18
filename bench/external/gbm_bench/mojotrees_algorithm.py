@@ -15,6 +15,8 @@ Two arms are registered.
                   quietly reporting a CPU number under a GPU label
 """
 
+import os
+
 import numpy as np
 
 import mojotrees
@@ -30,7 +32,16 @@ PARITY_NOTES = {
         "gbm-bench passes LightGBM's `max_leaves` alias; mojotrees spells it "
         "`num_leaves`. Same quantity, same value (256)."
     ),
-    "nthread": "gbm-bench's `nthread` is `n_jobs` here. Same quantity.",
+    "nthread": (
+        "gbm-bench passes its `-cpus` as LightGBM's `nthread`. mojotrees "
+        "refuses an explicit `n_jobs` by design, because a fit is "
+        "bit-identical at every worker count and the count comes from "
+        "MOJOTREES_NUM_WORKERS and the machine. So the arm exports "
+        "MOJOTREES_NUM_WORKERS with the same value gbm-bench gave the other "
+        "libraries. Same quantity, set through the only door mojotrees "
+        "offers. It is process-wide, so both mojotrees arms in an "
+        "interleaved run share it, which is what we want."
+    ),
     "scale_pos_weight": (
         "LightGBM's binary-only `scale_pos_weight=w` is `class_weight={1: w}` "
         "in mojotrees. Same reweighting, different spelling."
@@ -50,12 +61,17 @@ class MojoTreesAlgorithm(Algorithm):
         params = shared_params.copy()
         params.update({
             "num_leaves": 256,
-            "n_jobs": args.cpus if args.cpus else None,
             "n_estimators": args.ntrees,
             "device": self.device,
         })
         params.update(args.extra)
         return params
+
+    @staticmethod
+    def _apply_worker_count(args):
+        """gbm-bench's -cpus, delivered the only way mojotrees accepts it."""
+        if args.cpus:
+            os.environ["MOJOTREES_NUM_WORKERS"] = str(args.cpus)
 
     def _estimator(self, data, params):
         params = dict(params)
@@ -76,6 +92,7 @@ class MojoTreesAlgorithm(Algorithm):
         raise ValueError("unhandled learning task: " + str(task))
 
     def fit(self, data, args):
+        self._apply_worker_count(args)
         params = self.configure(data, args)
         model = self._estimator(data, params)
         with Timer() as t:
