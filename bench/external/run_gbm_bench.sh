@@ -37,11 +37,54 @@ if [ ! -d "$WORK" ]; then
   git clone --depth 1 https://github.com/NVIDIA/gbm-bench.git "$WORK"
 fi
 
+# ENVIRONMENT PRECONDITIONS, CHECKED BEFORE ANYTHING IS DOWNLOADED.
+#
+# Added 2026-08-18 after following the usage block above from a clean shell
+# failed twice in sequence: first `ModuleNotFoundError: No module named
+# 'pandas'`, because the bare `python3` below picks up the system interpreter
+# rather than the bench environment, and then `ModuleNotFoundError: No module
+# named 'mojotrees'`, because the bench environment does not install this
+# package and nothing put python/ on the path. It runs on the third attempt
+# with both fixed, and neither requirement appeared in the usage block, in
+# this script, or in the README.
+#
+# That matters more here than it would anywhere else in the tree. This
+# directory exists to answer "was the harness shaped around the result", and
+# its entire value is that a skeptical reader can rerun it. A script whose
+# documented invocation does not work, and whose working invocation lives
+# only in the shell history of whoever wrote it, does not have that property.
+# The numbers already in bench/results/ are good numbers; the point is that
+# nobody else could reproduce them from the repository alone.
+#
+# The check runs BEFORE the download rather than after it, because these
+# datasets are tens of gigabytes and failing on an import after fetching one
+# is the expensive ordering.
+PY_BIN="${GBM_BENCH_PYTHON:-python3}"
+export PYTHONPATH="$REPO_ROOT/python${PYTHONPATH:+:$PYTHONPATH}"
+if ! "$PY_BIN" -c "import pandas, sklearn, mojotrees" 2>/dev/null; then
+  cat >&2 <<'PRECHECK'
+run_gbm_bench.sh: the interpreter cannot import pandas, sklearn and mojotrees.
+
+This script needs the bench environment AND this repository's python/ on the
+path. It does not resolve either for you, because it does not know how you
+manage environments. Two ways that work here:
+
+  pixi run -e bench bash bench/external/run_gbm_bench.sh <dataset> <ntrees> [algos]
+
+  GBM_BENCH_PYTHON=/path/to/python bash bench/external/run_gbm_bench.sh ...
+
+PYTHONPATH is set for you and already points at the repository's python/.
+If mojotrees is the missing one, `pixi run build-python` writes the extension;
+note that `pixi run build-pkg` does NOT, which has caught people.
+PRECHECK
+  exit 2
+fi
+
 echo "==> pinning the harness commit for the record"
 GBM_SHA="$(git -C "$WORK" rev-parse HEAD)"
 
 echo "==> patching (idempotent)"
-python3 "$REPO_ROOT/bench/external/patch_gbm_bench.py" "$WORK"
+"$PY_BIN" "$REPO_ROOT/bench/external/patch_gbm_bench.py" "$WORK"
 
 mkdir -p "$DATA" "$REPO_ROOT/bench/results"
 
@@ -54,7 +97,7 @@ echo "    the harness downloads $DATASET into $DATA on first use; some of"
 echo "    these datasets are tens of GB, so check free space before airline"
 echo "    or bosch."
 cd "$WORK"
-python3 runme.py \
+"$PY_BIN" runme.py \
   -root "$DATA" \
   -dataset "$DATASET" \
   -algorithm "$ALGOS" \
