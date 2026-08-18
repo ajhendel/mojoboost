@@ -525,8 +525,16 @@ rows by 50 features the GPU trains in 3.58s against the CPU path's 6.98s, so
 seconds of fixed cost per fit. Multiclass is its clearest win, 15.30s
 against 25.47s. Against LightGBM we are still behind at the headline shape,
 2.44x on the CPU and 1.25x on the GPU. The record is
-`bench/results/profile_2026-08-15/RESULTS.md`. No NVIDIA and no AMD hardware
-has ever executed this code, not in CI and not on a laptop. There is one GPU
+`bench/results/profile_2026-08-15/RESULTS.md`. **Read that last sentence as
+history.** Every figure in this paragraph predates two changes made on
+2026-08-16, a `lambda_l2` default move and the deletion of the host split
+scan, which the README's benchmark section records as retiring earlier
+figures; the later run it does quote has the GPU ahead of LightGBM at
+799,110 x 100, a different shape. Nothing has re-measured 1,000,000 x 50
+since. All of it came off one Apple M4 laptop whose CPU and GPU share a single
+memory bus, which is a confound in both directions and is set out once under
+[How it performs](../../README.md#how-it-performs). No NVIDIA and no AMD
+hardware has ever executed this code, not in CI and not on a laptop. There is one GPU
 source and no per-vendor
 files, which is a reason to expect portability and is not evidence of it.
 `docs/GPU_VALIDATION.md` is the record and says what a backend has to

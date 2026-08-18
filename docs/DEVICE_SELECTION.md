@@ -9,6 +9,15 @@ vocabulary it implements is the one in `src/mojotrees/device.mojo`, which
 is the authority; this layer adds explanation, Python-level feature gates,
 a memory estimate, and a versioned table of measured crossovers.
 
+Every crossover figure quoted below was measured on one Apple M4 laptop, one
+machine and not a chip family, on a part whose CPU and GPU share a single
+memory bus. That shared bus is why a crossover measured here need not sit
+where a crossover on a machine with a discrete accelerator would sit, and it
+is one reason each rule is scoped to the hardware it was measured on rather
+than generalized. No NVIDIA or AMD device has ever run this code, so no rule
+covers one. The full scoping is under
+[How it performs](../README.md#how-it-performs) in the README.
+
 ## The three values
 
 | Value | Behavior |

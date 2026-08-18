@@ -668,7 +668,7 @@ reachable. Allocating the `MTLBuffer` outside MAX and handing its
 `gpuAddress` to `enqueue_function` fails on residency: MAX calls
 `useResource:usage:` for its own allocations only, and a bindless argument to
 a non-resident buffer is undefined. The gap is upstream, and
-`handoffs/upstream_max_metal_gaps.md` is the report.
+`docs/design/UPSTREAM_MAX_METAL_GAPS.md` is the report.
 
 #### 6.5.3 Every buffer is shared storage, and no allocation exposes both names
 

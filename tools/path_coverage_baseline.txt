@@ -1,0 +1,181 @@
+# Baseline for tools/check_path_coverage.py.  Companion to
+# docs/design/PATH_COVERAGE.md, which carries the verdicts; this
+# file carries only the facts the script can recompute.
+#
+# [BODIES]     execution bodies the coverage table owes a column.
+# [NOTBODIES]  names the body patterns caught that are not bodies.
+#              A name in NEITHER list fails the check.
+# [MECHANISMS] `label = symbol`, then one indented `file::owner`
+#              per reference site.  The set may not change without
+#              this file changing with it.
+
+[BODIES]
+distributed.mojo::_grow_tree_data_parallel
+distributed.mojo::_grow_tree_feature_parallel
+distributed.mojo::_grow_tree_voting_parallel
+gpu_resident_round.mojo::grow_tree_device_oblivious
+gpu_resident_round.mojo::grow_tree_device_resident
+predict.mojo::predict_oblivious_batch
+predict.mojo::predict_oblivious_raw_batch
+predict.mojo::predict_raw_batch
+train_gpu.mojo::_device_search_incremental
+train_gpu.mojo::_device_search_resident
+train_gpu.mojo::grow_tree_gpu_profiled
+train_gpu_sparse.mojo::grow_tree_gpu_sparse
+tree.mojo::_grow_oblivious_levels
+tree.mojo::grow_tree_leaves_profiled
+tree_sparse.mojo::grow_tree_sparse
+
+[NOTBODIES]
+boosting.mojo::predict_batch_range
+ctr_combinations.mojo::grow_tree_ctr_projections
+distributed.mojo::_grow_tree_distributed
+distributed.mojo::grow_tree_distributed
+gpu_active_rows.mojo::_grow_to
+gpu_sparse_layout.mojo::_grow_to
+linear_tree.mojo::predict_batch_raw
+model.mojo::predict_batch
+train_gpu.mojo::_device_search_semantics_supported
+train_gpu.mojo::_device_search_unsupported_reason
+train_gpu.mojo::_grow_tree_gpu_device_search
+train_gpu.mojo::grow_tree_gpu
+tree.mojo::grow_tree
+tree.mojo::grow_tree_leaves
+tree.mojo::grow_tree_profiled
+tree.mojo::grow_tree_with_cegb
+
+[MECHANISMS]
+compacted-bin-read = _ensure_compacted
+  gpu_active_rows.mojo::GpuActiveRows._ensure_compacted
+  gpu_active_rows.mojo::GpuActiveRows.enqueue_desc_histogram
+  gpu_active_rows.mojo::GpuActiveRows.enqueue_range_histogram
+
+compacted-bin-read-oblivious = oblivious_compacted_bins_requested
+
+const-hessian-declaration = set_constant_hessian
+  gpu_active_rows.mojo::GpuActiveRows.set_constant_hessian
+  gpu_leaf_batching.mojo::GpuLeafBatcher.set_constant_hessian
+  histogram_gpu.mojo::GpuHistogramBuilder.set_constant_hessian
+  train_gpu.mojo::train_gpu
+  train_gpu.mojo::train_gpu_with_valid
+
+device-histogram-batched-entry = enqueue_device_plan_batch_fused
+  gpu_leaf_batching.mojo::GpuLeafBatcher.enqueue_device_plan_batch_fused
+  histogram_gpu.mojo::GpuHistogramBuilder.enqueue_desc_level_children
+
+device-histogram-batched-subtracting = enqueue_device_plan_batch_fused_subtracting
+  gpu_leaf_batching.mojo::GpuLeafBatcher.enqueue_device_plan_batch_fused_subtracting
+  histogram_gpu.mojo::GpuHistogramBuilder.enqueue_desc_level_children
+
+device-histogram-desc-entry = enqueue_desc_histogram
+  gpu_active_rows.mojo::GpuActiveRows.enqueue_desc_histogram
+  histogram_gpu.mojo::GpuHistogramBuilder.enqueue_desc_child
+
+device-histogram-range-entry = enqueue_range_histogram
+  gpu_active_rows.mojo::GpuActiveRows.enqueue_range_histogram
+  histogram_gpu.mojo::GpuHistogramBuilder.enqueue_leaf
+
+device-resident-tree = resident_round_enabled
+  gpu_resident_round.mojo::resident_round_enabled
+  train_gpu.mojo::_grow_tree_gpu_device_search
+  train_gpu.mojo::_search_record_slots
+
+device-score-fold-by-leaf = update_raw_device
+  histogram_gpu.mojo::GpuHistogramBuilder.update_raw_device
+  train_gpu.mojo::_train_gpu_rounds
+  train_gpu.mojo::_train_multiclass_gpu_batched
+  train_gpu.mojo::_train_multiclass_gpu_rounds
+
+efb-bundled-histogram = expand_bundled_histogram
+  efb.mojo::expand_bundled_histogram
+  tree.mojo::_expand_bundled
+  tree_sparse.mojo::_node_histogram
+
+leaf-membership-score-update = _leaf_score_update_enabled
+  boosting.mojo::_boost_rounds
+  boosting.mojo::_boost_rounds_multiclass
+  boosting.mojo::_leaf_score_update_enabled
+  boosting.mojo::train_multiclass_with_valid
+  boosting.mojo::train_with_valid
+
+parallel-noise-staging = noise_stage_parallel_requested
+  gpu_split_search.mojo::noise_stage_parallel_requested
+  gpu_split_search.mojo::random_score_plane_into
+
+partition-tail-fusion = set_partition_fusion
+  gpu_active_rows.mojo::GpuActiveRows._refuse_copy_back_debt
+  gpu_active_rows.mojo::GpuActiveRows.set_partition_fusion
+  gpu_resident_round.mojo::grow_tree_device_oblivious
+  gpu_resident_round.mojo::grow_tree_device_resident
+
+predict-column-tiling = predict_tile_enabled
+  predict.mojo::apply_tiled
+  predict.mojo::predict_tile_enabled
+
+quantized-gradient-gpu = _ensure_quantized
+  gpu_active_rows.mojo::GpuActiveRows._ensure_quantized
+  gpu_active_rows.mojo::GpuActiveRows.enqueue_desc_histogram
+  gpu_active_rows.mojo::GpuActiveRows.enqueue_range_histogram
+
+quantized-histogram-cpu = build_histogram_subset_quantized_into_scratch
+  quantized_gradient.mojo::build_histogram_subset_maybe_quantized
+  quantized_gradient.mojo::build_histogram_subset_quantized_into_scratch
+
+raw-unbinned-predict = raw_predict_enabled
+  predict.mojo::oblivious_raw_plan
+  predict.mojo::raw_plan
+  predict.mojo::raw_predict_enabled
+
+sibling-subtraction-device-batched = enqueue_resident_leaf_subtracting
+  histogram_gpu.mojo::GpuHistogramBuilder.enqueue_resident_leaf_subtracting
+  train_gpu.mojo::_enqueue_resident_split
+
+sibling-subtraction-device-oblivious = oblivious_subtract_requested
+  gpu_leaf_batching.mojo::oblivious_subtract_requested
+  histogram_gpu.mojo::GpuHistogramBuilder.enqueue_desc_level_children
+  train_gpu.mojo::_grow_tree_gpu_device_search
+
+sibling-subtraction-device-slotwise = enqueue_resident_subtract
+  histogram_gpu.mojo::GpuHistogramBuilder.enqueue_resident_subtract
+
+sibling-subtraction-host-allocating = subtract_histogram
+  distributed.mojo::_grow_tree_data_parallel
+  distributed.mojo::_grow_tree_feature_parallel
+  distributed.mojo::_grow_tree_voting_parallel
+  histogram.mojo::subtract_histogram
+  train_gpu.mojo::grow_tree_gpu_profiled
+  train_gpu_sparse.mojo::grow_tree_gpu_sparse
+  tree_sparse.mojo::grow_tree_sparse
+
+sibling-subtraction-host-inplace = subtract_histogram_into
+  histogram.mojo::subtract_histogram
+  histogram.mojo::subtract_histogram_into
+  tree.mojo::_grow_oblivious_levels
+  tree.mojo::grow_tree_leaves_profiled
+
+speculative-prebuild = speculative_build_enabled
+  gpu_resident_round.mojo::grow_tree_device_oblivious
+  gpu_resident_round.mojo::grow_tree_device_resident
+  gpu_resident_round.mojo::oblivious_device_supported
+  gpu_resident_round.mojo::speculative_build_enabled
+
+table-upload-hoisting = table_upload_hoisting_requested
+  gpu_split_search.mojo::GpuSplitSearcher.__init__
+  gpu_split_search.mojo::table_upload_hoisting_requested
+
+terminal-child-elision-general = skip_terminal_children_enabled
+  train_gpu.mojo::_device_search_resident
+  train_gpu.mojo::skip_terminal_children_enabled
+
+terminal-child-elision-oblivious = oblivious_skip_last_build_requested
+  gpu_resident_round.mojo::grow_tree_device_oblivious
+  gpu_resident_round.mojo::oblivious_skip_last_build_requested
+  train_gpu.mojo::_grow_tree_gpu_device_search
+
+wide-scan-leafwise = wide_scan_requested
+  gpu_split_search.mojo::wide_scan_for
+  gpu_split_search.mojo::wide_scan_requested
+
+wide-scan-oblivious = oblivious_wide_scan_requested
+  gpu_split_search.mojo::_launch_oblivious_search
+  gpu_split_search.mojo::oblivious_wide_scan_requested

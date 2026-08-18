@@ -2,6 +2,37 @@
 
 Reproducible mojotrees vs LightGBM comparison on identical synthetic data.
 
+## One machine produced every number in this file
+
+Every figure below was measured on a single Apple M4 laptop, 10 CPU cores, 10
+GPU multiprocessors, 16 GB, macOS 26.5.2. One machine, not the M4 family and
+not Apple silicon in general. No NVIDIA or AMD device has ever executed this
+code, so every statement about CUDA or HIP performance anywhere in this
+repository is a prediction rather than a measurement, and
+[`../docs/GPU_VALIDATION.md`](../docs/GPU_VALIDATION.md) is the procedure that
+would replace one with the other.
+
+Three consequences worth carrying into every table here.
+
+The machine is a laptop, so thermal state and power source move the numbers.
+This file documents drift of a factor of two to three between time windows,
+which is why arms are compared only inside one invocation and why a figure
+from another window is not a weaker datapoint but an incomparable one.
+
+The CPU and the GPU share one memory bus, rated at about 120 GB/s
+([`../docs/METAL_TIMELINE.md`](../docs/METAL_TIMELINE.md) section 5). A
+mojotrees GPU arm and a CPU comparator therefore contend for the same
+bandwidth here, and neither ever has a memory system to itself. That makes the
+comparison fair in the narrow sense that one machine handicaps every arm the
+same way, and unrepresentative of a machine with a discrete accelerator, where
+the GPU brings its own memory and the CPU comparator keeps the whole host bus.
+The sign of the net effect is unknown and is not claimed in either direction.
+
+Whether these kernels are bandwidth bound is unsettled on this device, which
+exposes no bandwidth counter to Instruments. Section 5 of that same document
+narrows the histogram kernel's DRAM traffic only to somewhere between 21.6 and
+roughly 120 GB/s.
+
 Every `pixi run` command in this file names a task that exists. Which of them
 have ever produced a recorded number is a different question, and it is answered
 per driver in [`results/INSTRUCTION_AUDIT.md`](results/INSTRUCTION_AUDIT.md).

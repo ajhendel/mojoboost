@@ -613,7 +613,7 @@ reader proposes next.
   `docs/METAL_TIMELINE.md` section 1.1 records that "the only device timer
   implementations present in the shipped binaries are the CUDA and HIP ones".
   So this is an upstream gap in MAX rather than a hardware limit, and
-  `handoffs/upstream_max_metal_gaps.md` is the report.
+  `docs/design/UPSTREAM_MAX_METAL_GAPS.md` is the report.
 
 So `phase_profile.mojo`'s statement that "per-kernel device time is not
 reachable on this machine by any route" is correct as of the recorded probes,

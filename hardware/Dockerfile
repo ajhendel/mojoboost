@@ -62,10 +62,27 @@ ENV PIXI_HOME=/opt/pixi
 ENV PATH=/opt/pixi/bin:$PATH
 RUN curl -fsSL https://pixi.sh/install.sh | sh
 
-# The validation scripts promise they need no root. Honor that here so a run in
-# this container exercises the same path a contributor runs on a bare host.
-RUN useradd --create-home --uid 1000 validator \
-    && install -d -o validator -g validator /work
+# The validation scripts promise they need no root. Honor that here, so that a
+# run in this container exercises the same path a contributor runs on a bare
+# host and a hidden root dependency in the procedure fails here rather than
+# hiding behind a container that happens to run as root.
+#
+# The id is an argument because a bind-mounted checkout is written by this user,
+# and on a Linux host a uid mismatch is a permission failure rather than a
+# mojotrees result. Match your own with `--build-arg VALIDATOR_UID=$(id -u)`.
+# Ubuntu 24.04 base images already ship a user at uid 1000, so the id is
+# reclaimed rather than sidestepped; picking a different one would silently
+# reintroduce the mismatch this argument exists to prevent.
+ARG VALIDATOR_UID=1000
+ARG VALIDATOR_GID=1000
+RUN set -eu; \
+    old="$(getent passwd "${VALIDATOR_UID}" | cut -d: -f1 || true)"; \
+    [ -z "$old" ] || userdel -r "$old" >/dev/null 2>&1 || userdel "$old"; \
+    getent group "${VALIDATOR_GID}" >/dev/null \
+        || groupadd -g "${VALIDATOR_GID}" validator; \
+    useradd --create-home --uid "${VALIDATOR_UID}" \
+        --gid "${VALIDATOR_GID}" validator; \
+    install -d -o validator -g validator /work
 USER validator
 WORKDIR /work
 

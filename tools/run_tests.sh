@@ -125,6 +125,25 @@ else
   NCPU=$(sysctl -n hw.ncpu 2>/dev/null || echo 4)
 fi
 DEFAULT_JOBS=$(( NCPU > 2 ? NCPU - 2 : 1 ))
+# The pool is sized by CPU count, but a GPU test is not bounded by the CPU:
+# it is bounded by the one accelerator every process in the pool has to share.
+# On the 10-core M4 this project is developed on, `NCPU - 2` is 8 and the
+# distinction never surfaces.  On a 256-core host it is 254, and 254 processes
+# each opening a device context against a single card do not run 254 times
+# faster; they thrash.  Measured on a RunPod RTX 5090 (256 vCPU), 2026-08-18:
+# GPU utilization sat at 0% with 7.1 GB of VRAM consumed by contexts alone,
+# one test was killed at 503s by MAX's own watchdog, and the suite made no
+# progress.  The same suite at MOJOTREES_TEST_JOBS=4 is what produced the
+# first NVIDIA result this repository holds.
+#
+# GPU_MAX_JOBS is a device-contention bound, not a throughput tuning knob, so
+# it is deliberately small and does not scale with NCPU.  An explicit
+# MOJOTREES_TEST_JOBS still wins: this clamps the DEFAULT, it does not
+# override a number somebody chose on purpose.
+GPU_MAX_JOBS="${MOJOTREES_GPU_TEST_JOBS:-4}"
+if [ "$MODE" = "gpu" ] && [ "$DEFAULT_JOBS" -gt "$GPU_MAX_JOBS" ]; then
+  DEFAULT_JOBS="$GPU_MAX_JOBS"
+fi
 JOBS="${MOJOTREES_TEST_JOBS:-$DEFAULT_JOBS}"
 USE_PKG="${MOJOTREES_TEST_PKG:-1}"
 
@@ -344,13 +363,87 @@ suite_ms() {
   if [ -n "$ms" ]; then echo "$ms"; else echo "?"; fi
 }
 
+# Run one test under a wall-clock cap.
+#
+# Why this exists: `run_one` used to invoke `mojo run` bare, so a test that
+# hung hung the whole suite with no upper bound and no diagnosis.  That is a
+# real failure mode rather than a hypothetical one.  On a RunPod RTX 5090
+# (2026-08-18) an over-subscribed GPU pool left tests parked on a contended
+# device; the only thing that ever stopped one was MAX's own watchdog at 503s,
+# which reports as a bare "Alarm clock" with no indication of which test or
+# why.  A suite that cannot distinguish "slow" from "wedged" cannot be run
+# unattended, which is precisely how it gets run on leased hardware.
+#
+# `timeout` is NOT portable: it is coreutils, so Linux runners have it and
+# macOS does not ship it at all (Homebrew coreutils installs it as `gtimeout`).
+# Since the development machines here are macOS and CI is Linux, a bare
+# `timeout` would silently protect CI and nothing else.  Hence the probe below
+# and the shell fallback, which uses only POSIX job control.
+if command -v timeout >/dev/null 2>&1; then
+  TIMEOUT_CMD="timeout"
+elif command -v gtimeout >/dev/null 2>&1; then
+  TIMEOUT_CMD="gtimeout"
+else
+  TIMEOUT_CMD=""
+fi
+# Generous by design.  This is a hang detector, not a performance budget: it
+# must never fire on a test that is merely slow on a cold compile cache, or it
+# would turn a green suite red for a reason that has nothing to do with the
+# code.  The slowest legitimate GPU test observed so far is well under a
+# minute of device time; the compile in front of it is what makes the wall
+# time long.  Set to 0 to disable.
+TEST_TIMEOUT="${MOJOTREES_TEST_TIMEOUT:-900}"
+
+# Fallback for hosts with neither `timeout` nor `gtimeout`: run the command in
+# the background, poll for the deadline, and kill it if it outlives one.
+# Returns 124 on timeout, matching coreutils, so the caller needs no special
+# case.
+run_with_deadline() {
+  local secs="$1"; shift
+  "$@" &
+  local pid=$!
+  local waited=0
+  while kill -0 "$pid" 2>/dev/null; do
+    if [ "$waited" -ge "$secs" ]; then
+      kill -9 "$pid" 2>/dev/null
+      wait "$pid" 2>/dev/null
+      return 124
+    fi
+    sleep 1
+    waited=$(( waited + 1 ))
+  done
+  wait "$pid"
+}
+
 run_one() {
   local name="$1"
   local log="$RESULTS/$name.log"
   local start=$SECONDS
-  if mojo run $PKG_INCLUDE -I tests $(extra_includes "$name") \
-        "tests/$name.mojo" >"$log" 2>&1; then
+  local rc=0
+
+  if [ "$TEST_TIMEOUT" -gt 0 ] 2>/dev/null; then
+    if [ -n "$TIMEOUT_CMD" ]; then
+      "$TIMEOUT_CMD" "$TEST_TIMEOUT" mojo run $PKG_INCLUDE -I tests \
+        $(extra_includes "$name") "tests/$name.mojo" >"$log" 2>&1 || rc=$?
+    else
+      run_with_deadline "$TEST_TIMEOUT" mojo run $PKG_INCLUDE -I tests \
+        $(extra_includes "$name") "tests/$name.mojo" >"$log" 2>&1 || rc=$?
+    fi
+  else
+    mojo run $PKG_INCLUDE -I tests $(extra_includes "$name") \
+      "tests/$name.mojo" >"$log" 2>&1 || rc=$?
+  fi
+
+  if [ "$rc" -eq 0 ]; then
     echo "  ok   $name ($((SECONDS - start))s wall, $(suite_ms "$log")ms in tests)"
+  elif [ "$rc" -eq 124 ]; then
+    # Distinguished from a plain failure on purpose: a timeout means the test
+    # never reported, so its log is truncated and its assertions are unknown.
+    # Reading it as "the assertions failed" would be wrong.
+    echo "timeout" >"$RESULTS/$name.failed"
+    echo "  TIMEOUT $name (killed after ${TEST_TIMEOUT}s; log is incomplete)" \
+      >>"$log"
+    echo "  TIMEOUT $name (killed after ${TEST_TIMEOUT}s, no result reported)"
   else
     echo "fail" >"$RESULTS/$name.failed"
     echo "  FAIL $name ($((SECONDS - start))s wall, $(suite_ms "$log")ms in tests)"

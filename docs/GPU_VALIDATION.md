@@ -26,7 +26,20 @@ output into the record section.
 
 Nothing in this repository should be read as a claim about NVIDIA or AMD
 behavior or performance. The Metal "partial" for phase timings means the
-harness runs and prints, not that a recorded sweep exists.
+harness runs and prints, not that a recorded sweep exists. In particular, the
+argument that a bandwidth-hungry histogram kernel would go faster on a card
+with its own high-bandwidth memory is a **prediction**, not a result, and one
+recorded execution of the procedure below on such a card is what would turn it
+into one.
+
+The Metal row is also one machine and not a chip family. Every Metal figure
+came off a single Apple M4 laptop, 10 CPU cores, 10 GPU multiprocessors, 16
+GB, macOS 26.5.2, whose CPU and GPU share one memory bus rated at about 120
+GB/s. Any comparison run on it puts our GPU arm and a CPU comparator on the
+same bandwidth, which handicaps every arm identically on this machine and does
+not represent a machine where the accelerator owns its memory and the CPU
+comparator keeps the whole host bus. No other Apple chip has run this code
+either.
 
 ## What validation means here
 

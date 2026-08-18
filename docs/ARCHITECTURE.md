@@ -158,6 +158,11 @@ and more accurate with ranges disjoint; on real data at 463,715 x 90 it loses
 to LightGBM by 1.30x, resolved. Both figures, and the caveats that qualify them
 (on battery, canary uncalibrated, five repeats rather than twelve), are in
 [../bench/results/COMPARISON_RUN_2026-08-16.md](../bench/results/COMPARISON_RUN_2026-08-16.md).
+Both were taken on the one Apple M4 laptop that has produced every number this
+project publishes, where the CPU and the GPU share one memory bus, so the two
+arms of that comparison were contending for the same bandwidth. What that
+leaves confounded, in both directions, is set out under
+[How it performs](../README.md#how-it-performs).
 
 | Owner | What | Why it lives there |
 |---|---|---|

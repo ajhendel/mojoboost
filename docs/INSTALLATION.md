@@ -378,6 +378,14 @@ by 50 features and above, where the GPU trains in 3.58s against the CPU's
 6.98s. Everything below that keeps the CPU, and below that shape the CPU
 really is the right answer on this hardware: at 250,000 rows the GPU takes
 1.89s against the CPU's 1.66s and at 50,000 it takes 1.63s against 0.564s.
+Those four seconds figures come from one run,
+[`bench/results/profile_2026-08-15/RESULTS.md`](../bench/results/profile_2026-08-15/RESULTS.md),
+on the one Apple M4 laptop that has produced every number this project
+publishes, and they were taken before two changes on 2026-08-16 that the
+[README's benchmark section](../README.md#benchmarks) records as retiring
+every earlier figure. Read them as the evidence the shipped rule was built on,
+which is what they are, and not as a current measurement. Nothing has
+re-measured that shape since.
 [docs/DEVICE_SELECTION.md](DEVICE_SELECTION.md) has the whole policy,
 including what the rule is scoped to and why, and what a redistributed wheel
 assumes about the hardware it is running on.
@@ -622,9 +630,11 @@ model.device_        # "cpu" below the crossover, "gpu" above it
 The crossover table that `auto` consults holds one rule. It is scoped to
 Metal on an Apple M4 for unweighted squared error, single output, at
 1,000,000 rows by 50 features and above, where the GPU has been measured at
-3.58s against the CPU's 6.98s. Anything the rule does not cover keeps the
-CPU, and the report says which half of "no rule covered this" applied, rather
-than implying the shape was too small.
+3.58s against the CPU's 6.98s, in
+[`bench/results/profile_2026-08-15/RESULTS.md`](../bench/results/profile_2026-08-15/RESULTS.md)
+and on the same single Apple M4 laptop as every other number here. Anything
+the rule does not cover keeps the CPU, and the report says which half of "no
+rule covered this" applied, rather than implying the shape was too small.
 
 Below that shape the CPU really is the right answer on this hardware, and
 that too is measured rather than assumed: at 250,000 rows the GPU takes 1.89s

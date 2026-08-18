@@ -382,7 +382,9 @@ exists (`train_gpu.mojo`) and on an Apple M4 it now beats the CPU trainer at
 the large end: 3.58s against 6.98s at 1,000,000 rows by 50 features, and
 15.30s against 25.47s on multiclass. It loses below about a million rows
 (1.89 against 1.66 at 250,000), and no NVIDIA or AMD device has executed this
-code at all. The gate that remains is therefore narrower and sharper than
+code at all. Those figures are `bench/results/profile_2026-08-15/RESULTS.md`,
+one run on one Apple M4 laptop, taken before the 2026-08-16 changes that
+retired the figures older than them and not re-measured since. The gate that remains is therefore narrower and sharper than
 "the GPU has never won": it is a **discrete-GPU** measurement, on hardware
 this project has never run on, at a shape a distributed job would actually
 use. A network layer under a backend measured only on one integrated Apple

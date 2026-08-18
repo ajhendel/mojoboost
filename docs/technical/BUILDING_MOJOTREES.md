@@ -4,6 +4,18 @@ Status: publication draft. Statements about architecture describe project
 intent and implementation. Statements about performance require results from
 the repository's benchmark protocol before publication.
 
+Scope of every number in this draft, which must survive into anything
+published from it. All of them were measured on a single Apple M4 laptop, one
+machine rather than a chip family, whose CPU and GPU share one memory bus
+rated at about 120 GB/s. That shared bus makes a Mac comparison fair in the
+sense that every arm is handicapped identically and unrepresentative of a
+machine with a discrete accelerator, where the GPU brings its own memory and
+the CPU comparator keeps the whole host bus. The machine is a laptop, so its
+timings drift by a factor of two to three between thermal windows. No NVIDIA
+or AMD device has ever executed this code, so any claim about a datacenter
+card is a prediction and is unmeasured. The full statement is under
+[How it performs](../../README.md#how-it-performs) in the README.
+
 By Andrew Hendel, creator and lead maintainer of mojotrees
 
 ## The premise
@@ -125,7 +137,10 @@ is a build property and is reported and warned on as one. `auto` chooses the
 CPU everywhere the rule does not cover and reports exactly which half of "no
 rule covered this" applied. Below that shape the CPU is genuinely the right
 answer on this hardware, since the device carries about 1.5 seconds of fixed
-cost per fit.
+cost per fit. That pair of seconds is one run,
+`bench/results/profile_2026-08-15/RESULTS.md`, and it predates two defaults
+changes of 2026-08-16 that retired the figures taken before them, so before
+publication it needs re-measuring rather than requoting.
 
 ## AI-assisted development and integration debt
 

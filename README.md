@@ -3,8 +3,11 @@
 [![PyPI](https://img.shields.io/pypi/v/mojotrees.svg)](https://pypi.org/project/mojotrees/)
 [![CI](https://github.com/mojotrees/mojotrees/actions/workflows/ci.yml/badge.svg)](https://github.com/mojotrees/mojotrees/actions/workflows/ci.yml)
 
-Native gradient-boosted trees accelerated by the GPU already inside Apple
-Silicon Macs, written in [Mojo](https://www.modular.com/mojo).
+Native gradient-boosted trees with one portable GPU source, written in
+[Mojo](https://www.modular.com/mojo). The accelerator backends are MAX's, not
+this project's, so the hardware this library targets is whatever Mojo targets.
+Today that is Metal, CUDA, and HIP. The GPU already inside an Apple Silicon
+Mac is the one that has actually run it.
 
 > [!IMPORTANT]
 > mojotrees is an experimental public alpha. Its feature surface is broad,
@@ -15,6 +18,10 @@ Silicon Macs, written in [Mojo](https://www.modular.com/mojo).
 > not rely on unvalidated hardware or parameter combinations in production.
 > On speed specifically, [How it performs](#how-it-performs) gives the
 > recorded comparison against LightGBM and CatBoost in both directions.
+> **Every performance number in this repository was measured on one Apple M4
+> laptop and on no other machine**, and that section opens with what the
+> single machine, its shared memory bus, and its thermal budget leave
+> confounded. No NVIDIA or AMD device has ever executed this code.
 
 mojotrees is a from-scratch GBDT library in the LightGBM family. It uses
 histogram-based split finding and leaf-wise (best-first) tree growth. Its
@@ -183,6 +190,26 @@ Neural networks reach the GPU in a Mac without difficulty. The three
 established gradient boosting libraries, still the workhorse for tabular
 data, do not.
 
+The Mac is where that gap is widest, so it is where this project started and
+it is the only place the gap has been closed with measurements. It is not the
+argument for the design. Each of the three libraries reaches its GPUs through
+a backend it wrote and maintains itself, which is why adding a vendor costs
+them a vendor's worth of work and why the vendor they all added is the same
+one. This project writes no backend at all. It states what it needs from a
+device and lets MAX compile that for each target, so the set of GPUs it can
+run on is a property of the compiler rather than of this codebase.
+
+Two limits on how far that reads. It is a statement about those three
+libraries on a Mac, cited above from their own documentation, and not a claim
+that mojotrees is the only boosted-tree implementation that reaches an Apple
+GPU. Apple ships `MLBoostedTreeRegressor` in Create ML, this repository has
+never measured it or established what hardware it uses, and it is named here
+so the sentence above is not read as excluding it. And it is not a claim that
+competitors cannot use a GPU anywhere, which would be false. XGBoost and
+CatBoost both accelerate on CUDA, and LightGBM models can be run on NVIDIA
+hardware through NVIDIA's Forest Inference Library. The gap is Apple silicon
+specifically.
+
 ## What runs where, and what has been proven
 
 These are two different claims and this project keeps them apart on purpose.
@@ -197,13 +224,44 @@ cooperative group, and no float atomic. See
 [docs/NVIDIA_GPU.md](docs/NVIDIA_GPU.md), and
 [docs/AMD_GPU.md](docs/AMD_GPU.md).
 
-**Validated.** One device. Every kernel measurement in this repository was
-taken on a single Apple M4 running Metal. No NVIDIA or AMD device has ever
-executed this code, and no number from either should be quoted until one
-does. [docs/PLATFORM_MATRIX.md](docs/PLATFORM_MATRIX.md) marks every row
+**Validated.** One device, and one machine holding it. Every measurement in
+this repository, kernel and end to end alike, was taken on a single Apple M4
+laptop running Metal. No other Apple chip has run it either, so no figure here
+is a statement about the M4 family or about Apple silicon in general. No
+NVIDIA or AMD device has ever executed this code, and no number from either
+should be quoted until one does. What that single machine leaves confounded,
+including a memory bus its CPU and GPU share, is in
+[The machine every number came from](#the-machine-every-number-came-from-and-what-that-leaves-unmeasured).
+[docs/PLATFORM_MATRIX.md](docs/PLATFORM_MATRIX.md) marks every row
 `validated`, `tested`, `designed`, or `unsupported`, and
 `packaging/matrix/validate_matrix.py` rejects a `validated` row that names no
 evidence file.
+
+**Inherited.** The portability is real and it is not all ours. This project
+writes against a primitive set and MAX compiles that source for each backend,
+so every statement above about CUDA and HIP is a statement about what those
+APIs specify and what MAX targets, not about a per-backend code path this
+project maintains. If a MAX backend does not lower one of the six primitives,
+or lowers it onto a bound this code does not know about, mojotrees owns the
+reproduction and the bug report rather than the fix, and the first symptom
+appears on hardware rather than in CI. That is the price of one source
+instead of three, and this project pays it deliberately.
+
+It is paid for something. The same arrangement means the target list is not
+fixed by this repository and does not grow by this repository's effort. A
+backend that MAX adds, and that lowers the six primitives in section 1 of
+[docs/GPU_PORTABILITY.md](docs/GPU_PORTABILITY.md), is a backend mojotrees
+reaches without a source change, arriving as `portable-untested` in
+`gpu_backend_policy.mojo` and needing a validation run rather than a port.
+The three API codes that policy covers today are the three MAX targets above,
+and a fourth is a policy addition made when MAX ships the target, not a
+rewrite. That makes this a live question rather than a hypothetical one.
+Qualcomm completed its acquisition of Modular on 2026-07-29 and has stated
+that MAX remains multi-vendor while it is optimized for Qualcomm's own
+accelerators.
+Nothing in this repository has run on Qualcomm hardware, no Qualcomm target
+is covered by the contract today, and this paragraph describes a mechanism
+and not a plan.
 
 What separates those two columns is access to hardware, not portability work.
 If you have an NVIDIA or AMD machine and are willing to run the suite on it,
@@ -228,6 +286,48 @@ mojotrees is **GPU-first**. On Apple silicon the GPU owns the data plane
 the device); the CPU owns the control plane, one core, roughly two host waits
 per tree.
 
+### The machine every number came from, and what that leaves unmeasured
+
+Read this once and it scopes every figure in this section. It is deliberately
+not repeated paragraph by paragraph.
+
+**One machine, one chip.** Every performance number this project has ever
+published was measured on a single Apple M4 laptop, 10 CPU cores, 10 GPU
+multiprocessors, 16 GB, macOS 26.5.2. Not the M4 family, not a range of Apple
+silicon, one machine. Support and validation are separate claims here and
+[What runs where, and what has been proven](#what-runs-where-and-what-has-been-proven)
+keeps them apart. The one source targets x86-64 and ARM64 CPUs and Metal,
+CUDA, and HIP GPUs; exactly one of those combinations has ever executed it.
+
+**It was a laptop, so thermal state and power source move these numbers.**
+This repository has measured the same benchmark drifting two- to threefold
+between time windows, which is why its harness compares only arms that were
+interleaved inside one run and treats a number from another window as
+incomparable rather than as a datapoint. The 2026-08-16 comparison below was
+taken on battery, and its record says so on every block.
+
+**Unified memory is a confound, and it runs in both directions.** On this part
+the CPU and the GPU share one memory bus, rated at about 120 GB/s
+([docs/METAL_TIMELINE.md](docs/METAL_TIMELINE.md) section 5), so our GPU arm
+and a CPU comparator draw on the same bus and neither side of any comparison
+here ever had a memory system to itself. In one sense that is fair, since the
+arms run sequentially on one machine and every arm is handicapped identically.
+In another it is unrepresentative, because on a machine with a discrete
+accelerator the GPU would have its own memory and the CPU comparator would
+keep the whole host bus. We do not know the sign of the net effect and we do
+not claim it runs against us. Whether the histogram kernel is bandwidth bound
+at all is itself unsettled on this device, which exposes no bandwidth counter;
+section 5 of that document narrows the kernel's DRAM traffic only to somewhere
+between 21.6 and roughly 120 GB/s.
+
+**No NVIDIA number and no AMD number exists.** Not one, here or anywhere else.
+The argument that a bandwidth-hungry kernel would go faster on a card carrying
+its own high-bandwidth memory is a **prediction and is unmeasured**. What
+would settle it is one execution of the procedure in
+[docs/GPU_VALIDATION.md](docs/GPU_VALIDATION.md) on such a card, recorded in
+that document's status table. Until then nothing in this section may be quoted
+as a cross-platform result.
+
 In the recorded comparison of **2026-08-16** (Apple M4, 100 trees, **799,110 x
 100** synthetic regression, five interleaved repeats, **on battery**, **canary
 uncalibrated**) the GPU backend trained in **3.62 s** against LightGBM's
@@ -248,7 +348,14 @@ every shape measured, from 100k to 700k rows, by **1.29x to 1.85x**, with the
 margin **widest at the smallest shape**. That is the opposite of what the
 profitability gate guarding it assumed, so the gate is being removed rather
 than re-tuned, and the host-scan loop with it. **Both still ship as of this
-commit**; the removal is on a branch and is not in this tree.
+commit**; the removal is on a branch and is not in this tree. That sweep
+compares two of our own GPU arms and says nothing about any other library.
+Its four shapes and both arms' absolute seconds are written down in the
+`GPU split selection` row of
+[docs/LIGHTGBM_PARITY.md](docs/LIGHTGBM_PARITY.md); **it carries no run id
+under `bench/results/`**, so under rule 10 of
+[bench/results/LANE_RULES.md](bench/results/LANE_RULES.md) it is an asserted
+figure rather than a filed one, and it is quoted here with that defect named.
 
 The CPU backend uses all cores and is the path for machines without an
 accelerator, for configurations the device refuses (sparse input, a custom
@@ -1021,7 +1128,12 @@ which `tests/test_gpu_split_search.mojo` asserts. **It is ON by default since
 no benchmark has priced it"; a benchmark priced it that day at 1.21x on
 799,110 x 100 continuous features, leaf-wise, with the two arms' ranges disjoint
 and rmse identical, so the reason for the default being off went away and the
-default went with it.
+default went with it. Same Apple M4 laptop as everything else here, three
+interleaved cycles inside one process, both arms on the GPU. The six samples
+behind it are recorded in `src/mojotrees/gpu_split_search.mojo` and in the
+`MOJOTREES_GPU_SPLIT_WIDE` row of `docs/design/SWITCH_GRID.md` and **not in
+any run directory under `bench/results/`**, which is a rule 10 defect in the
+figure rather than a doubt about the flip.
 
 `pixi run bench-hist-scaling` reports the two strategies side by side with
 kernel time separated from conversion, upload, download, and setup time. Every
@@ -2185,8 +2297,13 @@ tree, taking every GPU fit below 1,000,000 rows by 50 features, which is
 deleted. Neither is a caveat to read an old number through. They are the
 reason those numbers are not in this file.
 
-Every measurement in this repository was taken on one Apple M4. No NVIDIA or
-AMD device has ever run this code.
+Every measurement in this repository was taken on one Apple M4 laptop, and no
+NVIDIA or AMD device has ever run this code. What that one machine leaves
+confounded, and why a shared memory bus makes a Mac comparison both fair and
+unrepresentative at the same time, is set out once in
+[The machine every number came from](#the-machine-every-number-came-from-and-what-that-leaves-unmeasured)
+and is not repeated here. A run of these commands on your machine is a
+different machine's number and is not comparable with anything above.
 
 ```sh
 pixi run bench                 # mojotrees
