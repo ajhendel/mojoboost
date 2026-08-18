@@ -262,8 +262,7 @@ comptime _MAX_CAT_WORDS = 1 << 16
 
 # How far this interop has actually been checked. Read by
 # `lgbm_interop_status`, which the bindings and the Python facade are asked
-# to surface verbatim rather than paraphrase (see
-# handoffs/connect_16_lgbm_interop.md (deleted, recover with git log --all --diff-filter=D -- handoffs/connect_16_lgbm_interop.md)).
+# to surface verbatim rather than paraphrase.
 comptime LGBM_INTEROP_STATUS = String(
     "experimental: reads files written by a real LightGBM build. Measured"
     " 2026-08-18 against LightGBM 4.7.0 on 14 model variants; 13 imported"

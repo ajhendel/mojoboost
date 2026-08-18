@@ -105,9 +105,7 @@ Nothing in this file removes a synchronization from histogram_gpu.mojo or
 train_gpu.mojo, and nothing here has been measured. It is the model and the
 instrumentation that a removal has to be argued from, plus
 `audit_round`, which replays the current per-round operation sequence
-through the model so the argument is executable rather than prose. The
-handoff (`handoffs/apple_a5_runtime.md (deleted, recover with git log --all --diff-filter=D -- handoffs/apple_a5_runtime.md)`) lists which of today's
-synchronizations the model marks removable and what has to be proven first.
+through the model so the argument is executable rather than prose.
 
 Environment contract, matching the `MOJOTREES_` convention in parallel.mojo:
 
@@ -1759,7 +1757,7 @@ struct GpuSession(RoundLifecycle, Movable):
     and residency ledgers can actually skip an upload rather than only
     record that they could have. That, and routing the builder's drains
     through `sync_for_host_read` / `sync_for_host_write` instead of
-    `ctx.synchronize()`, are described in `handoffs/apple_a5_runtime.md (deleted, recover with git log --all --diff-filter=D -- handoffs/apple_a5_runtime.md)`.
+    `ctx.synchronize()`, are both still owed.
 
     Teardown is explicit. `close()` drains the queue once, releases the
     pooled slots, clears residency, and moves the lifecycle to `closed`; it
@@ -1832,7 +1830,7 @@ struct GpuSession(RoundLifecycle, Movable):
         # first launch of a planned kernel is attributed to warm-up instead
         # of disappearing into the first round. Front-loading the creation
         # itself needs typed `DeviceFunction` fields on whichever struct
-        # owns the context; see handoffs/performance_15_startup.md (deleted, recover with git log --all --diff-filter=D -- handoffs/performance_15_startup.md).
+        # owns the context.
         self.warmup = WarmupPlan.from_env()
         if self.warmup.level >= WARMUP_TRAIN:
             _ = self.warmup.include(KERNEL_HIST_ATOMIC)

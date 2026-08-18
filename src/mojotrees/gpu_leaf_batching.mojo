@@ -70,10 +70,9 @@ Where the leaves come from
 --------------------------
 The primitives here are worth exactly as much as the grower above them can
 feed them. `gpu_frontier.leaves_per_launch` computes the number for each of the
-four growers, and `handoffs/algorithm_22_leaf_batching.md (deleted, recover with git log --all --diff-filter=D -- handoffs/algorithm_22_leaf_batching.md)` states the
-consequence plainly rather than burying it: batching is a change to the
-*grower*, and these kernels are the half of it that can be built and reasoned
-about first. The three growers that can offer more than one leaf are the
+four growers. The consequence is worth stating plainly rather than burying:
+batching is a change to the *grower*, and these kernels are the half of it
+that can be built and reasoned about first. The three growers that can offer more than one leaf are the
 device-search path (two children per commit), a speculative frontier (up to two
 per speculated commit, and speculation is semantically free, see
 gpu_frontier.mojo), and level-wise growth (a whole level).

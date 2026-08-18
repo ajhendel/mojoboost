@@ -92,9 +92,9 @@ below used to assume one byte per cell silently; `plan_packed_window_for`
 takes the descriptor and refuses every layout that assumption is false for.
 
 Two constants used to be mirrored from `gpu_tiling.mojo` so this module could
-stand alone while it landed alongside concurrent work on that file. That was
-the pre-integration arrangement handoffs/performance_14_gpu_histogram.md (deleted, recover with git log --all --diff-filter=D -- handoffs/performance_14_gpu_histogram.md)
-recorded; `BYTES_PER_PARTIAL_CELL` is now imported from `gpu_tiling.mojo`
+stand alone while it landed alongside concurrent work on that file. That
+pre-integration arrangement is over: `BYTES_PER_PARTIAL_CELL` is now imported
+from `gpu_tiling.mojo`
 rather than copied. `MAX_BINS` is `binning.MAX_BINS`, the one bin ceiling
 (a bin index is a byte); it is imported here and re-exported to
 `gpu_active_rows.mojo`, `gpu_leaf_batching.mojo`, and

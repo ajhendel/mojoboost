@@ -567,9 +567,9 @@ def PyInit__mojotrees() abi("C") -> PythonObject:
         # positional arguments, which is the shape `_parse_params` already
         # uses and which needs no bet on how many arguments `def_function`
         # accepts (eight are proven by `predict_range`; ten were never
-        # tried). See handoffs/connect_14_bindings.md (deleted, recover with git log --all --diff-filter=D -- handoffs/connect_14_bindings.md) section 6.1(c).
+        # tried).
         m.def_function[decide_device_workload]("decide_device")
-        # -- structured inspection (migration_19_model_inspection.md) ----
+        # -- structured inspection ---------------------------------------
         m.def_function[dump_model]("dump_model")
         m.def_function[dump_model_multiclass]("dump_model_multiclass")
         m.def_function[split_values]("split_values")

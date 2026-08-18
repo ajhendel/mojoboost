@@ -372,9 +372,8 @@ from .unified_memory_policy import (
 # There is no `tests/parallel/test_device_policy.mojo`. Nothing asserts that
 # the three below still equal their source, so each is a copy that can drift
 # silently, and a drifted `MAX_GPU_ROWS` or `MAX_GPU_BINS` admits a workload
-# the kernels cannot index. handoffs/connect_05_device_policy.md (deleted, recover with git log --all --diff-filter=D -- handoffs/connect_05_device_policy.md) specifies
-# that test; it is unwritten and unrun, and this comment says so rather than
-# claiming a guarantee that does not exist.
+# the kernels cannot index. That test is unwritten and unrun, and this
+# comment says so rather than claiming a guarantee that does not exist.
 
 # `MAX_ROWS` in histogram_gpu.mojo: the histogram and partition kernels
 # index rows as Int32, which is also where the fixed-point accumulator
@@ -1415,9 +1414,8 @@ struct DeviceCapabilities(Copyable, Movable):
         Opens no device, and that constraint is structural rather than a
         preference: this module is reached from `params.mojo`'s import graph
         through `device.mojo`, so importing `max.gpu.host` here would put the
-        GPU host runtime in front of every CPU-only compile, and
-        handoffs/migration_20_device_policy.md (deleted, recover with git log --all --diff-filter=D -- handoffs/migration_20_device_policy.md) already declined a smaller
-        version of that change for the same reason.
+        GPU host runtime in front of every CPU-only compile. A smaller
+        version of that change was declined before, for the same reason.
 
         Identity therefore comes from the build target
         (`build_target_profile`, `PROFILE_BUILD_TARGET`), which is comptime
@@ -3797,7 +3795,6 @@ def decide_device_report(
 
     This is the entry point `python/mojotrees/device_selection.py` calls
     `decide_device` and the one that moves it off its `"narrow"` contract.
-    The exact binding is in handoffs/connect_05_device_policy.md (deleted, recover with git log --all --diff-filter=D -- handoffs/connect_05_device_policy.md).
 
     Never raises for a workload it refuses. A refusal is `blocked=true` in the
     returned lines with `message=` saying why, so a caller can ask "what would
@@ -3945,9 +3942,8 @@ def resolve_device_full(
     fail deeper in, which is precisely the outcome the refusal exists to
     prevent.
 
-    The exact call-site edits for `model.mojo` and `trainset.mojo` are in
-    handoffs/connect_05_device_policy.md (deleted, recover with git log --all --diff-filter=D -- handoffs/connect_05_device_policy.md). They are one lane over, so they are
-    a patch request rather than an edit.
+    The call-site edits for `model.mojo` and `trainset.mojo` are still
+    owed.
     """
     var request = DeviceRequest(
         device,

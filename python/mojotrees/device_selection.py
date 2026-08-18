@@ -56,8 +56,8 @@ one produced a given report:
   objective, a bin count, or the input flags were skipped natively and the
   report says so.
 
-`"narrow"` is a temporary state. It exists only until the binding named in
-`handoffs/migration_20_device_policy.md (deleted, recover with git log --all --diff-filter=D -- handoffs/migration_20_device_policy.md)` is added, and the code that
+`"narrow"` is a temporary state. It exists only until the full native
+binding is added, and the code that
 implements it is confined to `_NarrowNativePolicy` so it can be deleted in
 one piece. It computes nothing: on a refusal it reports the native error
 text, and on a success it reports the native backend.

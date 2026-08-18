@@ -35,8 +35,9 @@ The extension module does not expose the dump yet, so there is a fallback
 that parses `Booster.model_to_string()` and builds the same schema in
 Python. It is fenced off at the bottom of this file under one banner, and
 it is what every function here falls back to when the hook is missing.
-`handoffs/migration_19_model_inspection.md (deleted, recover with git log --all --diff-filter=D -- handoffs/migration_19_model_inspection.md)` names the exact binding
-functions and the exact lines to delete once they exist.
+The fallback and its `__all__` entry are deleted once the binding
+functions exist; the banner at the bottom of this file lists exactly what
+goes with them.
 
 Its one gap used to be the save format's: split gains were not serialized,
 so a dump built from the text reported `has_split_gain: False`. Model
@@ -801,9 +802,7 @@ def raw_scores(source, row):
 #
 # The six LightGBM attributes task 14 owns. Each is a one line read here so
 # that wiring it onto `_Base` is a property that delegates, and so that a
-# `Booster` answers the same question the same way. See
-# `handoffs/migration_19_model_inspection.md (deleted, recover with git log --all --diff-filter=D -- handoffs/migration_19_model_inspection.md)` for the exact patch each one
-# needs.
+# `Booster` answers the same question the same way.
 
 
 def booster_of(model):
@@ -902,8 +901,7 @@ def best_score_of(model):
 # the `import struct as _struct` at the top, the `_dump_from_text` call in
 # `dump_model`, the `_split_values_from_dump` call in `split_values`, and
 # the two `source = dump_model(source)` fallbacks in `leaf_index_of` and
-# `raw_scores`. `handoffs/migration_19_model_inspection.md (deleted, recover with git log --all --diff-filter=D -- handoffs/migration_19_model_inspection.md)` lists the
-# tests that change in the same commit; nothing above this banner does.
+# `raw_scores`. Nothing above this banner changes with them.
 
 
 #: Bin 0 of a categorical feature: missing, unseen, or dropped. Never a

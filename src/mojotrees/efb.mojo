@@ -86,9 +86,8 @@ library: `boosting_sparse.prepare_bundling_csc` fits a plan with
 bundled CSC matrix, so a sparse `fit` bundles today. It avoids the
 model-plumbing problem the same way the dense path does and not by a new
 mechanism: the plan stays inside the fit, the trees name original features and
-original bins, and no `FeatureBundling` reaches `Model`. What
-`handoffs/task13_efb.md (deleted, recover with git log --all --diff-filter=D -- handoffs/task13_efb.md)` sections 4, 6 and 10 describe is what a bundling plan
-that had to SCORE would need, and no path needs that.
+original bins, and no `FeatureBundling` reaches `Model`. A bundling plan that
+had to SCORE would need more than this, and no path needs that.
 
 `bundle_csc` and the sparse plan below are therefore live code with a caller,
 not spare parts.
@@ -338,7 +337,7 @@ def check_bundling_params(max_conflict_rate: Float64) raises:
         " collision drops a training value, and the loss lands in the trees"
         " where no metric reports it. Bundling itself is available"
         " ('enable_bundle'); only the lossy mode is withheld pending a"
-        " benchmark. See handoffs/connect_09_algorithms.md (deleted, recover with git log --all --diff-filter=D -- handoffs/connect_09_algorithms.md)"
+        " benchmark"
     )
 
 

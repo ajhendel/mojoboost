@@ -191,8 +191,7 @@ def require_backend_exercised(api: Int, what: String) raises:
     the Apple part this repository was developed on, and refusing it would
     refuse every run that ships, including every Metal one. The gate is
     exactly as strong as the backend identification reaching it; plumbing
-    the reported API name into the policy layer is what makes it bite, and
-    that patch request is in `handoffs/connect_20_gpu_portability.md (deleted, recover with git log --all --diff-filter=D -- handoffs/connect_20_gpu_portability.md)`.
+    the reported API name into the policy layer is what makes it bite.
     """
     require_backend_covered(api)
     if backend_is_exercised(api):

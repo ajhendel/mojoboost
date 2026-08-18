@@ -26,12 +26,11 @@ Two rules it exists to keep:
 
 History. Version 1 was a *proposal* covering `mojotrees.cv` and
 `mojotrees.dask` only, written by the lane that owned those two modules
-(handoffs/integration_06_python_api.md (deleted, recover with git log --all --diff-filter=D -- handoffs/integration_06_python_api.md)) for a later owner of `__init__.py`
-to apply. Version 2 is the state after that owner applied it and finished
+for a later owner of `__init__.py` to apply. Version 2 is the state after that owner applied it and finished
 the surface: `cv` and `CVBooster` are exported, the `__getattr__` is in
 place, and the `inspection` / `device_selection` placeholders have been
-replaced by what those lanes actually shipped. See
-handoffs/connect_07_python_public.md (deleted, recover with git log --all --diff-filter=D -- handoffs/connect_07_python_public.md). Version 3 renames the two tables
+replaced by what those lanes actually shipped. Version 3 renames the two
+tables
 that still said `PROPOSED_` after their contents had shipped, adds the
 `lgbm_model_io` lazy submodule the integration round wired, and points
 at the test that now holds all of it to the code.
@@ -276,7 +275,7 @@ LAZY_SUBMODULES = (
     {
         "name": "device_selection",
         "optional_dependency": None,
-        "owner": "handoffs/migration_20_device_policy.md (deleted, recover with git log --all --diff-filter=D -- handoffs/migration_20_device_policy.md)",
+        "owner": "src/mojotrees/device_policy.mojo",
         "note": (
             "A formatter over the native policy, with no policy of its "
             "own. `_Base._resolve_device` imports it inside the call, so a "
@@ -288,10 +287,7 @@ LAZY_SUBMODULES = (
     {
         "name": "diagnostics",
         "optional_dependency": None,
-        "owner": (
-            "handoffs/performance_15_startup.md (deleted, recover with git log --all --diff-filter=D -- handoffs/performance_15_startup.md), "
-            "handoffs/connect_05_device_policy.md (deleted, recover with git log --all --diff-filter=D -- handoffs/connect_05_device_policy.md)"
-        ),
+        "owner": "src/mojotrees/device_policy.mojo",
         "note": (
             "Reads the filesystem rather than importing the extension, "
             "which is what makes it usable from a cold interpreter. "
@@ -318,7 +314,7 @@ LAZY_SUBMODULES = (
     {
         "name": "inspection",
         "optional_dependency": "pandas (for the frame output only)",
-        "owner": "handoffs/migration_19_model_inspection.md (deleted, recover with git log --all --diff-filter=D -- handoffs/migration_19_model_inspection.md)",
+        "owner": "bindings/inspection_bindings.mojo",
         "note": (
             "Reaches pandas from trees_to_dataframe and "
             "get_split_value_histogram(as_frame=True) and from nowhere "
@@ -481,7 +477,7 @@ NOT_EXPORTED = (
             "And the classifier and the ranker. fit() raises "
             "DistributedNotAvailable on every installation: no transport "
             "ships. A top-level export would read as a feature. Revisit "
-            "when handoffs/task17_dask.md (deleted, recover with git log --all --diff-filter=D -- handoffs/task17_dask.md)'s checklist is complete."
+            "when a transport ships."
         ),
     },
     {
@@ -533,7 +529,7 @@ LIGHTGBM_DIFFERENCES = (
             "Booster.update() does not cover LambdaRank, so a ranking fold "
             "is trained once at the full round count instead of grown. "
             "Refused rather than accepted and ignored. Lifting it is "
-            "native work: handoffs/task15_cv.md (deleted, recover with git log --all --diff-filter=D -- handoffs/task15_cv.md)."
+            "native work."
         ),
     },
     {

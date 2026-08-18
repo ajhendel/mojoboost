@@ -33,9 +33,7 @@ recycle a handful of histograms instead of allocating two arrays per node
 kernels and produce bit-identical results; only the allocation differs.
 
 Three things about the CPU shape of these kernels, all of them scheduling or
-memory traffic and none of them arithmetic (see
-`handoffs/performance_13_apple_cpu.md (deleted, recover with git log --all --diff-filter=D -- handoffs/performance_13_apple_cpu.md)` for the mechanism behind each and for
-what still needs measuring):
+memory traffic and none of them arithmetic:
 
 - **Zeroing is fused into the feature pass, not run before it.** A build
   writes every one of the `n_features * n_bins` cells and then accumulates

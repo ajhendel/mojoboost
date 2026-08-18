@@ -9,8 +9,7 @@ and partition-local prediction against a model this file trains locally.
 
 What it does not cover, and what no test in this repository covers, is
 distributed training: no backend exists yet, so `DaskRuntime` and every
-claim about what a worker does are unexercised. See
-handoffs/task17_dask.md (deleted, recover with git log --all --diff-filter=D -- handoffs/task17_dask.md).
+claim about what a worker does are unexercised.
 """
 
 import os

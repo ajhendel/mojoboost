@@ -130,9 +130,7 @@ package cannot then also answer `mojotrees.cv` with this module: the
 function wins the attribute, and `import mojotrees.cv as m` binds `m` to
 the function rather than to the module. `from mojotrees.cv import cv,
 CVBooster` keeps working either way, because that form goes through the
-import system rather than through the attribute. That trade is deliberate
-and is written up, with the alternative, in
-handoffs/integration_06_python_api.md (deleted, recover with git log --all --diff-filter=D -- handoffs/integration_06_python_api.md).
+import system rather than through the attribute. That trade is deliberate.
 
 Differences from LightGBM
 -------------------------
@@ -145,8 +143,8 @@ Differences from LightGBM
   at the full round count instead of grown a round at a time. Its history
   has one entry, `results["iterations"] == [num_boost_round]`, and
   `early_stopping_rounds=` and `callbacks=` are refused rather than accepted
-  and quietly ignored. See handoffs/task15_cv.md (deleted, recover with git log --all --diff-filter=D -- handoffs/task15_cv.md) for the native work that
-  would lift this.
+  and quietly ignored. Lifting this needs continued training to cover
+  LambdaRank natively.
 - **Callbacks see 4-tuples.** LightGBM's `cv` hands callbacks a 5-tuple
   carrying the standard deviation, which is what `log_evaluation`'s
   `show_stdv` formats. `mojotrees.callback` unpacks exactly four, so this
@@ -163,7 +161,7 @@ Differences from LightGBM
   the one the model was trained on, by comparing the binning, and a fold is
   by construction binned over its own rows. So every fold would be rejected
   by the trainer, and the argument is refused here with the reason rather
-  than passed on to fail per fold. See handoffs/task15_cv.md (deleted, recover with git log --all --diff-filter=D -- handoffs/task15_cv.md).
+  than passed on to fail per fold.
 """
 
 import math
@@ -519,8 +517,8 @@ class FoldModel:
     - `booster`, the `Booster` that holds the model;
     - `data(side)`, the `Dataset` of `'train'` or `'valid'`.
 
-    See handoffs/task15_cv.md (deleted, recover with git log --all --diff-filter=D -- handoffs/task15_cv.md) for the native work that would let every task
-    take the incremental path.
+    Letting every task take the incremental path is native work that has
+    not been done.
     """
 
     def checkpoints(self, rounds):
@@ -738,8 +736,8 @@ class CVBooster:
         A `reset_parameter()` schedule changes hyperparameters between
         rounds, which `Booster` does not expose. Accepting the call and
         training the next round with the old values would make a schedule
-        look like it ran, so it raises instead. handoffs/task15_cv.md (deleted, recover with git log --all --diff-filter=D -- handoffs/task15_cv.md) holds
-        the requirement that would make it work.
+        look like it ran, so it raises instead. Making it work needs
+        `Booster` to expose a per-round parameter reset.
         """
         raise NotImplementedError(
             "parameters cannot be reset between cv rounds: a fold is a "
@@ -977,7 +975,7 @@ def cv(
             "init_model does not reach the folds: continued training needs "
             "the dataset the model was trained on, and each cv fold bins "
             "itself over its own rows, so the trainer refuses every one of "
-            "them. See handoffs/task15_cv.md (deleted, recover with git log --all --diff-filter=D -- handoffs/task15_cv.md)"
+            "them"
         )
 
     incremental = config.task != _eval.RANKING
@@ -987,14 +985,14 @@ def cv(
                 "callbacks need a per-round history, and a ranking cv has "
                 "one round it can report: continued training does not cover "
                 "LambdaRank, so each fold is trained once at the full round "
-                "count. See handoffs/task15_cv.md (deleted, recover with git log --all --diff-filter=D -- handoffs/task15_cv.md)"
+                "count"
             )
         if stop_rounds:
             raise NotImplementedError(
                 "early stopping needs a per-round history, and a ranking cv "
                 "has one round it can report: continued training does not "
                 "cover LambdaRank, so each fold is trained once at the full "
-                "round count. See handoffs/task15_cv.md (deleted, recover with git log --all --diff-filter=D -- handoffs/task15_cv.md)"
+                "round count"
             )
 
     if folds is None:

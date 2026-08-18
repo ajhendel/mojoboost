@@ -82,9 +82,7 @@ and a stub that pretends would be worse than an error that says so.
 already copies the fixed-point planes into pinned host memory and
 `histogram_from_host` converts them to Float64. The exchange belongs exactly
 between those two calls, and `reduce_fixed_words` is shaped to sit there. It
-is not wired in, because wiring it means editing histogram_gpu.mojo, which
-this lane does not own; the patch is written out in
-handoffs/remaining_09_distributed_strategies.md (deleted, recover with git log --all --diff-filter=D -- handoffs/remaining_09_distributed_strategies.md).
+is not wired in, because wiring it means editing histogram_gpu.mojo.
 
 **It does not support anything but data parallelism.** `check_gpu_strategy`
 refuses the other modes rather than leaving the combination undefined.
