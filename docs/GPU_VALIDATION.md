@@ -731,6 +731,51 @@ broken".
 Both suite runs were also terminated by an external 60-minute kill
 (`RC=137`), so the counts are lower bounds on a truncated run, not totals.
 
+#### 2c. What the deadlock is NOT, established by experiment
+
+Six explanations were tested on the RTX 5090 and six were eliminated. They are
+recorded so the next lane spends its money on something else.
+
+| explanation | how it died |
+|---|---|
+| Job contention | 32 timeouts at `jobs=4` against 26 at `jobs=12`. Fewer jobs made it worse. |
+| CPU oversubscription | The container advertises 256 CPUs against a `cpu.max` quota of 27.2. Real, and fixed, and **not this**: the suite is unchanged with the cgroup clamp in place. |
+| Slow NVPTX codegen | The heartbeat shows processes burning 18-30% CPU and then dropping to **zero ticks** with threads in `futex_wait_queue`. A compiler burns CPU until it finishes. |
+| Stale readback | The unsynchronized copy was a real defect and is fixed. The deadlock is unchanged. |
+| Resident grower queue depth | `MOJOTREES_GPU_TREE_RESIDENT=0` timed out identically to the default on **two** tests (`test_gpu_tree_resident`, `test_gpu_training`), both `rc=124` at ~400s. |
+| **MAX's allocator, launches, or queue depth** | **Two MAX-only probes pass.** See below. |
+
+The last one is the load-bearing result. `probes/cuda_deadlock_alloc.mojo` and
+`probes/cuda_deadlock_launch.mojo` import **nothing** from this package, and
+between them they perform 8,000 device allocations, pinned host allocations,
+copies with no drain between, 3,000 kernel launches on a reused buffer, 3,000
+allocate-then-launch cycles, and 3,000 allocations plus launches with **no
+`synchronize()` at all** until the end. Every phase completes:
+
+```text
+PHASE_A_OK  PHASE_B_OK  PHASE_C_OK  REPRO_COMPLETED_NO_DEADLOCK
+PHASE_D_OK  PHASE_E_OK  PHASE_F_OK  REPRO2_COMPLETED_NO_DEADLOCK
+```
+
+So the runtime primitives are sound on this device and the deadlock requires
+something this repository does that they do not cover. It is ours.
+
+#### 2d. Candidates that remain, in the order worth testing
+
+1. **`create_sub_buffer`.** `GpuSplitSearcher.records_dev` owns `rec_i_dev`
+   and `rec_f_dev` as windows onto one allocation. It sits on the exact path
+   that hangs and is the one operation neither probe exercises. Adding it is a
+   ten-line edit to `probes/cuda_deadlock_launch.mojo`.
+2. **The 48 KiB shared-memory path.** This device reports
+   `max_shared_memory_per_block = 49152` against the M4's 32768, so feature
+   group 16 at 256 bins **raises on every Mac and is accepted here**. That is
+   code no machine in this project's history has executed, and it targets the
+   histogram-arm tests specifically.
+3. **Device access from parallel workers.** Fits reach the device from inside
+   `sync_parallelize`; both probes are single-threaded.
+
+Each is a small edit to an existing probe and each returns a yes or no.
+
 #### 3. Determinism
 
 **Not run.** Repeat-run bit-identity was never attempted on this device. Every

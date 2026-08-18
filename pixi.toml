@@ -160,6 +160,14 @@ test-c = "capi/run_c_tests.sh"
 # and reports which transports this MAX version and this backend can reach at
 # all. Takes optional `trips trials`.
 probe-readback = "bash tools/with_timeout.sh auto mojo run -I src probes/readback_cost.mojo"
+# The two MAX-only reproductions written while chasing the CUDA deadlock of
+# 2026-08-18. They import NOTHING from this package on purpose: if a hang
+# reproduces here it is upstream, and if it does not the cause needs something
+# mojotrees does that these primitives do not cover. Both PASS on an RTX 5090,
+# which is what moved that diagnosis from "MAX is broken" to "ours, and
+# narrower than we thought". See docs/GPU_VALIDATION.md.
+probe-cuda-alloc = "bash tools/with_timeout.sh auto mojo run probes/cuda_deadlock_alloc.mojo"
+probe-cuda-launch = "bash tools/with_timeout.sh auto mojo run probes/cuda_deadlock_launch.mojo"
 
 [dependencies]
 mojo = ">=1.0.0,<2"
