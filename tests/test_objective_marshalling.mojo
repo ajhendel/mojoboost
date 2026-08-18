@@ -236,94 +236,77 @@ def _workload(objective: Int, n_outputs: Int) raises -> PythonObject:
 
     Built rather than modelled: the point of this test is what the binding
     does to a value on its way through, so the value has to actually go
-    through it.
+    through it. And built BY THE SENDER, through
+    `device_selection.workload_mapping`, which is now the one place the key
+    set is written down.
 
-    `ordered_boosting`, `score_function`, `random_strength` and
-    `derivative_precision` are REQUIRED keys on this mapping, not optional
-    ones, because `basic_bindings.mojo` reads all four with no default,
-    deliberately, so a stale sender cannot silently mean "L2, plain boosting,
-    no split noise, float32". This helper did not send the first two for the
-    two hours after they became required, and the consequence is worth
-    recording, because it is the reason three tests in this file failed at
-    once. The missing key raised a CPython `KeyError` inside
-    `decide_device_workload`, so all three died at the CALL and not one of
-    their assertions ever ran. Every assertion in them was true the whole
-    time. A fixture is a claim about the caller too.
+    That call is the fix for a defect this fixture had four times. Every key
+    is read on the native side with no default, deliberately, so that a stale
+    sender cannot silently mean "L2, plain boosting, no split noise, float32".
+    The cost of that choice is that a fixture missing a key dies at the CALL,
+    before any assertion runs. It happened for two hours when
+    `ordered_boosting` and `score_function` became required, for 646 commits
+    when `random_strength` and `derivative_precision` did on a branch with no
+    continuous integration, and twice on 2026-08-18 when five more keys
+    arrived in one day. Each time three tests failed together, every assertion
+    in them true the whole time.
 
-    **It happened again, to the same three tests, and this time for 646
-    commits.** `73d808a` and `9d51e29` added `random_strength` and
-    `derivative_precision` to the required set; the branch they landed on ran
-    no continuous integration, so nothing said so until the branch was
-    promoted. The keys are added here with the values
-    `device_selection.py:296-299` sends by default, and that is the point. A
-    fixture is stale when it disagrees with the shipping sender, and the
-    shipping sender is the one that is right.
-
-    Both are the NEUTRAL values as well as the default ones, and that is a
-    second requirement rather than a coincidence. `_collect_blocks` gates the
-    accelerator on `derivative_precision != DERIV_PRECISION_FLOAT32`
-    (device_policy.mojo:2200), so a fixture that sent float64 to be
-    interesting would add a blocking reason to every workload here and the
-    tests above would be asserting about a run the policy had already refused
-    for an unrelated reason. `random_strength` reaches the same gate. The
-    fixture's job is to be complete and boring so that the assertions are
-    about the objective alone.
-
-    **The keys are still hand-maintained and that is the standing weakness.**
-    The sender builds its mapping as a dict literal inline inside
-    `_FullNativePolicy.decide` (device_selection.py:692-710), so there is
-    nothing this file can call to obtain the key set; deriving it means
-    extracting that literal into a function in `python/mojotrees/`, which is
-    proposed rather than done here. What IS done is `_decide` below, which
-    turns the next drift from an unnamed CPython `KeyError` at the call into a
-    failure that says the mapping went stale and lists what this fixture
-    sends.
+    A default `Workload` supplies neutral values, which is a requirement
+    rather than a convenience. `_collect_blocks` gates the accelerator on
+    `derivative_precision != DERIV_PRECISION_FLOAT32` and on `random_strength`,
+    so a fixture that sent something interesting would add a blocking reason
+    to every workload here and these tests would be asserting about a run the
+    policy had already refused for an unrelated reason. The fixture's job is
+    to be complete and boring so the assertions are about the objective alone.
     """
-    var w = Python.import_module("builtins").dict()
-    w["n_rows"] = PythonObject(1000)
-    w["n_features"] = PythonObject(10)
+    # BUILT BY THE SENDER, NOT BY HAND. `workload_mapping` in
+    # device_selection.py is the one place the key set is written down, and
+    # `_FullNativePolicy.decide` builds its mapping with the same call. A
+    # field added to the request therefore appears here automatically.
+    #
+    # This fixture drifted FOUR times before that function existed, three of
+    # them to these same three tests and one of them for 646 commits, because
+    # the sender built its mapping as a dict literal inline and there was
+    # nothing for this file to import. Five keys were added on 2026-08-18
+    # alone. The native reader takes every key with no default on purpose, so
+    # each drift surfaced as a KeyError hours later rather than as a wrong
+    # decision, which is the good failure mode and still cost the time.
+    #
+    # A default `Workload` carries exactly the neutral values this fixture
+    # wants, which is the second reason to build it this way: the fixture must
+    # not send anything interesting, or it would add a blocking reason to
+    # every workload here and the assertions would be about a run the policy
+    # had already refused for an unrelated cause.
+    # Loaded as a FILE rather than as `mojotrees.device_selection`, because
+    # importing the package would execute `mojotrees/__init__.py` and pull in
+    # the compiled extension, which this test does not need and which is not
+    # on the interpreter's path when the Mojo suite runs. `device_selection.py`
+    # imports only `json` at module scope, so it loads standalone.
+    var os = Python.import_module("os")
+    var util = Python.import_module("importlib.util")
+    var rel = os.path.join("python", "mojotrees", "device_selection.py")
+    var root = os.path.abspath(os.getcwd())
+    var target = os.path.join(root, rel)
+    while not Bool(os.path.exists(target)):
+        var parent = os.path.dirname(root)
+        if String(parent) == String(root):
+            raise Error(
+                "could not find ",
+                rel,
+                " walking up from ",
+                String(os.getcwd()),
+            )
+        root = parent
+        target = os.path.join(root, rel)
+    var spec = util.spec_from_file_location("mt_device_selection", target)
+    var selection = util.module_from_spec(spec)
+    spec.loader.exec_module(selection)
+    var w = selection.workload_mapping(
+        selection.Workload(n_rows=1000, n_features=10)
+    )
     w["n_outputs"] = PythonObject(n_outputs)
-    w["n_bins"] = PythonObject(_BINS)
     w["objective"] = PythonObject(objective)
-    w["sparse"] = PythonObject(0)
-    w["categorical"] = PythonObject(0)
-    w["has_missing"] = PythonObject(0)
-    w["uses_validation"] = PythonObject(0)
-    w["ordered_boosting"] = PythonObject(0)
-    w["score_function"] = PythonObject(0)  # split.SCORE_L2
-    w["random_strength"] = PythonObject(0.0)  # CatBoost's split noise, off
-    # tree_parameters_extra.DERIV_PRECISION_FLOAT32
-    w["derivative_precision"] = PythonObject(0)
-    # **AND IT HAPPENED A THIRD TIME, ON 2026-08-18, TO THE SAME THREE TESTS.**
-    # 60e82b9 added `grow_policy` and `max_depth` to the required set so that
-    # BLOCK_GROW_POLICY and BLOCK_MAX_DEPTH could fire at all, and ae2df6d
-    # added `bundling`, `linear_tree` and `forced_splits` for the same reason
-    # on the last three blocks that existed and could not fire. Five keys in
-    # one day, and the suite is what said so, four hours later.
-    #
-    # Every value below is the NEUTRAL one as well as the sender's default,
-    # for the reason the paragraph above gives: a fixture that sent something
-    # interesting would add a blocking reason to every workload here and the
-    # assertions would be about a run the policy had already refused for an
-    # unrelated cause. GROW_LEAFWISE is 0 and an unlimited depth is 0, and all
-    # three flags are off.
-    w["grow_policy"] = PythonObject(0)  # growth_policy.GROW_LEAFWISE
-    w["max_depth"] = PythonObject(0)  # 0 or below means unlimited
-    w["bundling"] = PythonObject(0)
-    w["linear_tree"] = PythonObject(0)
-    w["forced_splits"] = PythonObject(0)
-    #
-    # THE STANDING WEAKNESS IS NOW NAMED WITH ITS FIX RATHER THAN JUST NAMED.
-    # Three occurrences in one file is not bad luck, it is a missing source of
-    # truth: the sender builds its mapping as a dict literal inline inside
-    # `_FullNativePolicy.decide`, so there is nothing for this fixture to
-    # import and agreement can only be maintained by hand. The fix is to
-    # extract that literal into a named function in `device_selection.py` that
-    # both the sender and this fixture call, at which point drift becomes
-    # impossible rather than merely detectable. Until that lands, a lane that
-    # adds a required key to `basic_bindings.decide_device_workload` must edit
-    # this helper in the same commit, and the reason it keeps not happening is
-    # that nothing makes the omission fail until the suite runs.
+    w["n_bins"] = PythonObject(_BINS)
     return w^
 
 
@@ -333,18 +316,19 @@ def _decide(objective: Int, n_outputs: Int) raises -> String:
 
     Every key `decide_device_workload` reads is read with no default, on
     purpose, so a mapping that has gone stale against the binding fails at the
-    CALL rather than at an assertion. That is the right failure and it has now
-    been produced twice; what it has never done is say what went wrong. Three
-    tests die together, the message is a bare key name from CPython, and
-    nothing points at the fixture as the thing that is behind rather than at
-    the decision as the thing that is wrong.
+    CALL rather than at an assertion. That is the right failure, and what it
+    never did was say what went wrong: three tests die together, the message
+    is a bare key name from CPython, and nothing points at the fixture as the
+    thing that is behind rather than at the decision as the thing that is
+    wrong.
 
     So the exception is caught only to be re-raised with that sentence
     attached. Nothing is swallowed. The original message is carried through,
     every test still fails, and they fail for the same reason they did before.
-    This is the in-file half of the fix. The other half, deriving the key set
-    from the sender instead of retyping it, needs a file this lane does not
-    own and is proposed in `_workload`'s docstring.
+    This is the second line of defence now that `_workload` builds its mapping
+    from the sender: it should no longer be reachable by drift, and it stays
+    because a mapping can still go stale in ways that call does not cover, for
+    instance a key the native reader adds and the sender has not.
 
     `"cpu"` for all three callers, because the boundary tests are about what
     the marshaller does to the objective on the way through, and asking for a

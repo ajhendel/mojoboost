@@ -715,6 +715,70 @@ def _split_transfer(value):
     return TransferRoute(parts[0] if parts else "unknown")
 
 
+def workload_mapping(workload):
+    """The `Workload` as the mapping the native `decide_device` reads.
+
+    **The single source of truth for that mapping, and it exists because the
+    key set drifted four times.** It used to be a dict literal inline in
+    `_FullNativePolicy.decide`, which meant the only other thing that builds
+    one, the fixture in `tests/test_objective_marshalling.mojo`, had nothing
+    to import and could only be kept in agreement by hand. It was not: five
+    keys were added on 2026-08-18 alone, and each time the suite failed hours
+    later with a `KeyError` from the native side, which reads every key with
+    no default on purpose.
+
+    Anything that builds this mapping must call this function, so that adding
+    a field is one edit instead of two that can be done independently.
+    """
+    return {
+            "n_rows": int(workload.n_rows),
+            "n_features": int(workload.n_features),
+            "n_outputs": int(workload.n_outputs),
+            "n_bins": _BINS_UNSPECIFIED
+            if workload.max_bin is None
+            else int(workload.max_bin),
+            "objective": _OBJECTIVE_UNSPECIFIED
+            if workload.objective_code is None
+            else int(workload.objective_code),
+            "sparse": 1 if workload.sparse else 0,
+            "categorical": 1 if workload.categorical else 0,
+            "has_missing": 1 if workload.has_missing else 0,
+            "uses_validation": 1 if workload.has_eval_set else 0,
+            "ordered_boosting": 1 if workload.ordered_boosting else 0,
+            "score_function": int(workload.score_function),
+            "random_strength": float(workload.random_strength),
+            "derivative_precision": int(workload.derivative_precision),
+            # Added 2026-08-18. Without these two the native
+            # `DeviceRequest` took its own defaults of GROW_LEAFWISE and
+            # 0, so `BLOCK_GROW_POLICY` and `BLOCK_MAX_DEPTH` could never
+            # match and the `auto` fallback they implement was
+            # unreachable from Python. A symmetric fit above the device
+            # depth bound raised out of the trainer instead of falling
+            # back to the CPU, which is the opposite of the shipped
+            # ruling.
+            "grow_policy": int(workload.grow_policy),
+            "max_depth": int(workload.max_depth),
+            # Added 2026-08-18, the last three blocks that existed and
+            # could not fire. `device_policy` has carried
+            # BLOCK_FEATURE_BUNDLING, BLOCK_LINEAR_TREE and
+            # BLOCK_FORCED_SPLITS with keyword defaults of False, and
+            # `basic_bindings` said so in its own comment: these three
+            # "are NOT sent from Python". So the native request always saw
+            # False, every one of the three silently never matched, and a
+            # user got a raise out of the trainer instead of the CPU
+            # fallback the policy implements.
+            #
+            # The forced-splits case was the worst of the three, because
+            # its raise text advised "device='auto', which routes around
+            # this" and auto did not, since the field it would route on
+            # never arrived. The error message advertised the disconnected
+            # path.
+            "bundling": 1 if workload.bundling else 0,
+            "linear_tree": 1 if workload.linear_tree else 0,
+            "forced_splits": 1 if workload.forced_splits else 0,
+        }
+
+
 class _FullNativePolicy:
     """The intended path: the whole contract crosses in one call.
 
@@ -746,56 +810,7 @@ class _FullNativePolicy:
         # undeclared, so the boundary carries no Python bool conversion and
         # no optional. That is the convention the rest of the bindings
         # already use (see `goss` in bindings/_mojotrees.mojo).
-        text = self._decide(
-            requested,
-            {
-                "n_rows": int(workload.n_rows),
-                "n_features": int(workload.n_features),
-                "n_outputs": int(workload.n_outputs),
-                "n_bins": _BINS_UNSPECIFIED
-                if workload.max_bin is None
-                else int(workload.max_bin),
-                "objective": _OBJECTIVE_UNSPECIFIED
-                if workload.objective_code is None
-                else int(workload.objective_code),
-                "sparse": 1 if workload.sparse else 0,
-                "categorical": 1 if workload.categorical else 0,
-                "has_missing": 1 if workload.has_missing else 0,
-                "uses_validation": 1 if workload.has_eval_set else 0,
-                "ordered_boosting": 1 if workload.ordered_boosting else 0,
-                "score_function": int(workload.score_function),
-                "random_strength": float(workload.random_strength),
-                "derivative_precision": int(workload.derivative_precision),
-                # Added 2026-08-18. Without these two the native
-                # `DeviceRequest` took its own defaults of GROW_LEAFWISE and
-                # 0, so `BLOCK_GROW_POLICY` and `BLOCK_MAX_DEPTH` could never
-                # match and the `auto` fallback they implement was
-                # unreachable from Python. A symmetric fit above the device
-                # depth bound raised out of the trainer instead of falling
-                # back to the CPU, which is the opposite of the shipped
-                # ruling.
-                "grow_policy": int(workload.grow_policy),
-                "max_depth": int(workload.max_depth),
-                # Added 2026-08-18, the last three blocks that existed and
-                # could not fire. `device_policy` has carried
-                # BLOCK_FEATURE_BUNDLING, BLOCK_LINEAR_TREE and
-                # BLOCK_FORCED_SPLITS with keyword defaults of False, and
-                # `basic_bindings` said so in its own comment: these three
-                # "are NOT sent from Python". So the native request always saw
-                # False, every one of the three silently never matched, and a
-                # user got a raise out of the trainer instead of the CPU
-                # fallback the policy implements.
-                #
-                # The forced-splits case was the worst of the three, because
-                # its raise text advised "device='auto', which routes around
-                # this" and auto did not, since the field it would route on
-                # never arrived. The error message advertised the disconnected
-                # path.
-                "bundling": 1 if workload.bundling else 0,
-                "linear_tree": 1 if workload.linear_tree else 0,
-                "forced_splits": 1 if workload.forced_splits else 0,
-            },
-        )
+        text = self._decide(requested, workload_mapping(workload))
         return _parse_decision(str(text))
 
 
