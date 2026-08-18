@@ -49,6 +49,20 @@ locality explanation is dead.** Do not open a lane on it. What the switch is
 actually doing is not yet mechanistic and should not be quoted as though it
 were.
 
+**READ THIS WITH SECTION 6, BECAUSE THE TWO LOOK LIKE THEY DISAGREE AND DO
+NOT.** Section 6 finds that small-node degradation IS the story for the
+accumulate, at 19.4x. That is not a contradiction of the sentence above, and
+the distinction is the whole mechanism. What is dead here is small-node
+**read** locality as the explanation for THIS SWITCH: the switch changes which
+address a bin id is loaded from, and it wins on 90 dense continuous columns
+rather than on small nodes. What section 6 identifies is small-node **write**
+reuse in the histogram, which this switch does not touch at all. Same node
+classes, opposite side of the memory traffic.
+
+Written down explicitly because a reader skimming for "is small-node locality
+the problem" would find both sentences and pick one, and picking the wrong one
+costs a lane.
+
 ## 2. Feature-group schedule clamp, `MOJOTREES_CPU_FEATURE_GROUP`. CLOSED, NULL.
 
 Same run, same interleaving. Setting the group width to the cache-derived
