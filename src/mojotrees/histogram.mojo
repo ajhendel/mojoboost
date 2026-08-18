@@ -2149,18 +2149,115 @@ def build_histogram_subset_into_scratch(
     # One runtime test per build, selecting between two compile-time
     # instantiations; see `build_histogram_into_scratch` for why it is here
     # and not inside a row loop.
+    # THE COMPACT ACCUMULATOR, off unless `MOJOTREES_CPU_PACKED_HIST=1`.
+    #
+    # A rectangular histogram is `n_features * n_bins` cells whatever the data
+    # does with them. On covertype that is 54 x 255 = 13,770 cells at 24 bytes,
+    # 322.7 KB against a 64 KB L1, while the cells any row can actually reach
+    # number `sum_f feature_bins[f]`, about 2,400, or 56.2 KB, which fits.
+    # Forty-four of those columns are binary, so packed they sit four to a
+    # cache line where rectangular they are 4,080 bytes apart.
+    #
+    # It should matter most exactly where the profile says the cost is. This
+    # accumulate is partitioned by FEATURE, so at a large node the tasks each
+    # walk a slice that fits anyway; at a small node one task walks all 54
+    # columns, and the measured per-slot rate there is 19.4x the root's.
+    #
+    # IT IS NOT BIT-IDENTICAL, AND THE FIRST VERSION OF THIS COMMENT SAID IT
+    # WAS. The packing itself is: the same Float64 additions happen in the
+    # same order at different addresses, and `_expand_packed_histogram` is a
+    # copy. But packing forces row blocking OFF, because the blocked arm keeps
+    # rectangular partials in the scratch tail, and a block count IS a
+    # summation order. So on any node the planner would have blocked, this
+    # switch changes the model exactly as `MOJOTREES_CPU_ROW_BLOCKS=1` does.
+    #
+    # Measured 2026-08-18, run `20260818T185452Z-packed`: identical prediction
+    # digests on year at both shapes, DIFFERENT digests on covertype at both.
+    # The earlier check that called it identical used a synthetic 40k-row
+    # shape the planner never blocks, so it could not have shown the
+    # difference. Bit-identity has to be checked on a shape that exercises the
+    # thing being changed.
+    #
+    # It is therefore Tier 2 and cannot be flipped on a timing alone.
+    #
+    # Inert unless the caller built the width table, because `_row_major_
+    # widths` is a pass over every bin and this function runs once per node.
+    var packed = (
+        getenv("MOJOTREES_CPU_PACKED_HIST") == "1"
+        and data.has_packed_offsets()
+    )
+    if packed:
+        var cells = data.bin_offset[data.n_features]
+        var pgh = List[Float64]()
+        var pcount = List[Int]()
+        pgh.resize(2 * cells, 0.0)
+        pcount.resize(cells, 0)
+        if _resolve_narrow(const_hessian_env):
+            _accumulate_subset[True](
+                pgh, pcount, pairs,
+                data, grad, hess, rows, row_start, row_count, features,
+                const_h, True, settings,
+            )
+        else:
+            _accumulate_subset[False](
+                pgh, pcount, pairs,
+                data, grad, hess, rows, row_start, row_count, features,
+                const_h, True, settings,
+            )
+        _expand_packed_histogram(out, pgh, pcount, data)
+        return
+
     if _resolve_narrow(const_hessian_env):
         _accumulate_subset[True](
             out._gh, out._count, pairs,
             data, grad, hess, rows, row_start, row_count, features, const_h,
-            settings,
+            False, settings,
         )
     else:
         _accumulate_subset[False](
             out._gh, out._count, pairs,
             data, grad, hess, rows, row_start, row_count, features, const_h,
-            settings,
+            False, settings,
         )
+
+
+def _expand_packed_histogram(
+    mut out: Histogram,
+    packed_gh: List[Float64],
+    packed_count: List[Int],
+    data: BinnedMatrix,
+) raises:
+    """Compact cells to the rectangular `f * n_bins + b` every consumer reads.
+
+    Feature f holds `feature_bins[f]` cells at `bin_offset[f]`; they are copied
+    to `f * n_bins`, and the bins beyond that width are zeroed. Those bins are
+    ones no row can reach, since `feature_bins[f]` is the observed maximum plus
+    one, but the split scan still reads them and a stale value there would be a
+    phantom bin.
+
+    One sequential write-only pass per node, replacing a scattered
+    read-modify-write over five times the footprint. Not parallel: it is
+    `n_features * n_bins` stores against an accumulate of `rows * n_features`
+    updates, and a dispatch here would contend with the one that just ended.
+    """
+    var nf = data.n_features
+    var nb = data.n_bins
+    var ghp = out._gh.unsafe_ptr()
+    var cp = out._count.unsafe_ptr()
+    var pgh = packed_gh.unsafe_ptr()
+    var pc = packed_count.unsafe_ptr()
+    for f in range(nf):
+        var src = data.bin_offset[f]
+        var w = data.feature_bins[f]
+        var dst = f * nb
+        for b in range(w):
+            ghp.unsafe_store(
+                2 * (dst + b), pgh.unsafe_load[width=2](2 * (src + b))
+            )
+            cp.unsafe_store(dst + b, pc.unsafe_load(src + b))
+        for b in range(w, nb):
+            ghp.unsafe_store(2 * (dst + b), SIMD[DType.float64, 2](0.0))
+            cp.unsafe_store(dst + b, 0)
 
 
 def _gather_pairs[
@@ -2268,6 +2365,7 @@ def _accumulate_subset[
     row_count: Int,
     features: List[Int],
     const_h: Bool,
+    packed: Bool = False,
     settings: DispatchSettings = DispatchSettings.unresolved(),
 ) raises:
     var n_bins = data.n_bins
@@ -2279,10 +2377,16 @@ def _accumulate_subset[
         settings, n_features, n_active, n_bins, n_sub, True, const_h
     )
 
-    _zero_excluded(
-        out_gh, out_count,
-        n_features, n_bins, features, plan.excluded_ops, settings,
-    )
+    # Skipped when packed, and equivalently rather than as an omission: the
+    # compact buffer is freshly zeroed for every node, so an excluded feature
+    # is already zero there and `_expand_packed_histogram` copies that zero
+    # into the rectangular output. Running it would also be a wild write,
+    # since it indexes `f * n_bins` into a buffer that has no such cell.
+    if not packed:
+        _zero_excluded(
+            out_gh, out_count,
+            n_features, n_bins, features, plan.excluded_ops, settings,
+        )
 
     # The scratch layout, which is this function's to define: the gather
     # occupies `[0, n_sub)` when it runs -- one Float64 word per row, holding
@@ -2334,6 +2438,14 @@ def _accumulate_subset[
         blocked = plan.blocked()
     else:
         use_pairs = plan.compact_rows and float64_gather_arm()
+    # The blocked arm keeps its private partial histograms in the TAIL of the
+    # scratch at `part_off`, sized from `n_features * n_bins`, and indexes
+    # them rectangularly. None of that is true of a compact buffer, so the two
+    # are exclusive and the flat ladder runs instead. Combining them means
+    # packing the partials as well, which is the row-major blocked kernel's
+    # existing trick and a separate change.
+    if packed:
+        blocked = False
     if use_pairs:
         # Words, not rows, and the two arms differ: one packed word per row
         # against two unconverted Float64 words. See `ensure_pair_capacity`.
@@ -2406,35 +2518,35 @@ def _accumulate_subset[
             out_gh, out_count, pairs, data, grad, hess,
             rows, row_start, row_count, features,
             use_pairs, n_active, plan.group_count, plan.active_ops,
-            const_h, settings,
+            const_h, packed, settings,
         )
     elif group >= 8:
         _accumulate_subset_at[8, NARROW](
             out_gh, out_count, pairs, data, grad, hess,
             rows, row_start, row_count, features,
             use_pairs, n_active, plan.group_count, plan.active_ops,
-            const_h, settings,
+            const_h, packed, settings,
         )
     elif group >= 4:
         _accumulate_subset_at[4, NARROW](
             out_gh, out_count, pairs, data, grad, hess,
             rows, row_start, row_count, features,
             use_pairs, n_active, plan.group_count, plan.active_ops,
-            const_h, settings,
+            const_h, packed, settings,
         )
     elif group >= 2:
         _accumulate_subset_at[2, NARROW](
             out_gh, out_count, pairs, data, grad, hess,
             rows, row_start, row_count, features,
             use_pairs, n_active, plan.group_count, plan.active_ops,
-            const_h, settings,
+            const_h, packed, settings,
         )
     else:
         _accumulate_subset_at[1, NARROW](
             out_gh, out_count, pairs, data, grad, hess,
             rows, row_start, row_count, features,
             use_pairs, n_active, plan.group_count, plan.active_ops,
-            const_h, settings,
+            const_h, packed, settings,
         )
 
 
@@ -2456,6 +2568,7 @@ def _accumulate_subset_at[
     n_groups: Int,
     active_ops: Int,
     const_h: Bool,
+    packed: Bool = False,
     settings: DispatchSettings = DispatchSettings.unresolved(),
 ) raises:
     """The subset accumulation at one interleave width.
@@ -2489,6 +2602,12 @@ def _accumulate_subset_at[
     var use_all = len(features) == 0
     var ghp = out_gh.unsafe_ptr()
     var cp = out_count.unsafe_ptr()
+    # Compact mode: `out_gh` is the caller's packed scratch rather than a
+    # rectangular histogram, feature f's cells start at `bin_offset[f]`, and
+    # it has exactly `feature_bins[f]` of them. The caller expands.
+    var offs_p = data.bin_offset.unsafe_ptr()
+    var width_p = data.feature_bins.unsafe_ptr()
+
     var grad_p = grad.unsafe_ptr()
     var hess_p = hess.unsafe_ptr()
     var rows_p = rows.unsafe_ptr().unsafe_offset(row_start)
@@ -2513,18 +2632,28 @@ def _accumulate_subset_at[
                 owned = GROUP
             var base = SIMD[DType.int, GROUP](0)
             var col = SIMD[DType.int, GROUP](0)
+            # Bins feature k actually has. `n_bins` rectangular, its real
+            # width packed, and it bounds the zeroing and the const_h refill
+            # so neither walks cells no row can reach.
+            var width = SIMD[DType.int, GROUP](n_bins)
             comptime for k in range(GROUP):
                 if k < owned:
                     var f = (
                         (slot0 + k) if use_all
                         else feat_p.unsafe_load(slot0 + k)
                     )
-                    base[k] = f * n_bins
+                    base[k] = (
+                        offs_p.unsafe_load(f) if packed else f * n_bins
+                    )
                     col[k] = f * n_rows
+                    width[k] = (
+                        width_p.unsafe_load(f) if packed else n_bins
+                    )
 
             comptime for k in range(GROUP):
                 if k < owned:
                     var z0 = Int(base[k])
+                    var zw = Int(width[k])
                     var zb = 0
                     # The `const_h` skip of the hessian plane is gone, and
                     # the branch with it: a hessian shares a 16-byte cell and
@@ -2533,13 +2662,13 @@ def _accumulate_subset_at[
                     # the elided lanes were never a saved line -- only a
                     # saved 8 bytes inside one already being written. The
                     # refill below still overwrites them.
-                    while zb + W <= n_bins:
+                    while zb + W <= zw:
                         ghp.unsafe_store(
                             2 * (z0 + zb), SIMD[DType.float64, 2 * W](0.0)
                         )
                         cp.unsafe_store(z0 + zb, SIMD[DType.int, W](0))
                         zb += W
-                    while zb < n_bins:
+                    while zb < zw:
                         ghp.unsafe_store(
                             2 * (z0 + zb), SIMD[DType.float64, 2](0.0)
                         )
@@ -2635,6 +2764,7 @@ def _accumulate_subset_at[
                 comptime for k in range(GROUP):
                     if k < owned:
                         var f0 = Int(base[k])
+                        var fw = Int(width[k])
                         var fb = 0
                         # Writing only the odd lanes of an interleaved run
                         # means reading the even ones back to rejoin them.
@@ -2643,7 +2773,7 @@ def _accumulate_subset_at[
                         # `interleave` are lane permutations with no
                         # arithmetic, so the Float64 that lands is the Float64
                         # the plane store landed.
-                        while fb + W <= n_bins:
+                        while fb + W <= fw:
                             var cur = ghp.unsafe_load[width = 2 * W](
                                 2 * (f0 + fb)
                             )
@@ -2662,7 +2792,7 @@ def _accumulate_subset_at[
                                 ),
                             )
                             fb += W
-                        while fb < n_bins:
+                        while fb < fw:
                             ghp.unsafe_store(
                                 2 * (f0 + fb) + 1,
                                 Float64(cp.unsafe_load(f0 + fb)),

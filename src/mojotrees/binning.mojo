@@ -2787,6 +2787,48 @@ struct BinnedMatrix(Copyable, Movable):
         self.feature_bins = width_of^
         self.bin_offset = offsets^
 
+    def build_packed_offsets(mut self) raises:
+        """Fill `feature_bins` and `bin_offset` WITHOUT the row-major array.
+
+        `build_row_major` computes these widths on its way to a second copy of
+        every bin id, and until 2026-08-18 that was the only way to get them.
+        A caller that wants a compact histogram wants the width table and not
+        the second copy: the table is `n_features` ints, the copy is
+        `n_rows * row_stride` bytes and can be refused by the memory budget.
+
+        Costs one pass over `bins`, the same pass `build_row_major` makes, and
+        is a function of `bins` alone, so it is idempotent and two matrices
+        holding the same bytes always get the same table.
+
+        Does nothing when the table is already present, so calling it beside
+        `build_row_major` in either order is free.
+        """
+        if (
+            len(self.feature_bins) == self.n_features
+            and len(self.bin_offset) == self.n_features + 1
+        ):
+            return
+        var nf = self.n_features
+        var nr = self.n_rows
+        if nf <= 0 or nr <= 0 or len(self.bins) != nr * nf:
+            return
+        var width_of = List[Int]()
+        width_of.resize(nf, 1)
+        _row_major_widths(self.bins, nr, nf, width_of)
+        var offsets = List[Int]()
+        offsets.append(0)
+        for f in range(nf):
+            offsets.append(offsets[f] + width_of[f])
+        self.feature_bins = width_of^
+        self.bin_offset = offsets^
+
+    def has_packed_offsets(self) -> Bool:
+        """Whether `feature_bins` and `bin_offset` are both populated."""
+        return (
+            len(self.feature_bins) == self.n_features
+            and len(self.bin_offset) == self.n_features + 1
+        )
+
     def drop_row_major(mut self):
         """Release the row-major view and its `row_major_bytes()`."""
         self.row_bins = []
@@ -2813,6 +2855,8 @@ def _rebuild_row_major(mut matrix: BinnedMatrix, build_view: Bool) raises:
         matrix.build_row_major(0)
     elif mode == ROW_MAJOR_AUTO:
         matrix.build_row_major(row_major_budget_bytes())
+    if getenv("MOJOTREES_CPU_PACKED_HIST") == "1":
+        matrix.build_packed_offsets()
 
 
 def append_ctr_columns(
@@ -3451,6 +3495,12 @@ struct BinMapper(Copyable, Movable):
             out.build_row_major(0)
         elif mode == ROW_MAJOR_AUTO:
             out.build_row_major(row_major_budget_bytes())
+        # The compact histogram wants the width table and not the second copy
+        # of every bin id, so it is built separately and only when asked for.
+        # `build_row_major` fills the same two fields on its way past, and
+        # this is idempotent, so the order of the two does not matter.
+        if getenv("MOJOTREES_CPU_PACKED_HIST") == "1":
+            out.build_packed_offsets()
         return out^
 
     def bin_row(self, row: List[Float64]) raises -> List[Int]:
