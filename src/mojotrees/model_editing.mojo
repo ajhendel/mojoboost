@@ -108,6 +108,7 @@ from std.math import exp
 
 from .binning import BinMapper, BinnedMatrix
 from .boosting import (
+    _softmax_rows,
     Booster,
     CUSTOM,
     IterationRange,
@@ -1844,10 +1845,13 @@ def refit_multiclass(
     report.n_trees = len(booster.trees)
 
     for i in range(booster.n_iterations()):
-        for r in range(n):
-            for k in range(k_n):
-                prob[r * k_n + k] = raw[r * k_n + k]
-            _softmax_inplace(prob, r * k_n, k_n)
+        # PARALLEL. This ran as a serial per-row `_softmax_inplace` walk until
+        # 2026-08-18, when `boosting._softmax_rows` was measured at 1.21x on
+        # covertype -- and that change reached only `boosting.mojo`, leaving
+        # this copy and six others behind. Same helper, same guarantee: a
+        # row's softmax touches only that row's K slots, so the map is
+        # elementwise across rows and bit-identical at any task count.
+        _softmax_rows(raw, prob, n, k_n)
         for k in range(k_n):
             _fill_softmax_grad_hess(
                 prob, labels, k, k_n, sample_weight, grad, hess,

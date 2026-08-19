@@ -132,6 +132,7 @@ from .bagging import (
 from .binning import BinnedMatrix, fit_bins
 from .linear_tree import check_linear_tree_unconnected
 from .boosting import (
+    _softmax_rows,
     Booster,
     BoosterParams,
     MulticlassBooster,
@@ -942,10 +943,13 @@ def _dart_rounds_multiclass(
         )
 
         refresh_bag(bag, bagging, n, round)
-        for r in range(n):
-            for k in range(n_classes):
-                prob[r * n_classes + k] = raw[r * n_classes + k]
-            _softmax_inplace(prob, r * n_classes, n_classes)
+        # PARALLEL. This ran as a serial per-row `_softmax_inplace` walk until
+        # 2026-08-18, when `boosting._softmax_rows` was measured at 1.21x on
+        # covertype -- and that change reached only `boosting.mojo`, leaving
+        # this copy and six others behind. Same helper, same guarantee: a
+        # row's softmax touches only that row's K slots, so the map is
+        # elementwise across rows and bit-identical at any task count.
+        _softmax_rows(raw, prob, n, n_classes)
 
         var grown = List[Tree](capacity=n_classes)
         var made_progress = False
@@ -1236,10 +1240,13 @@ def train_dart_multiclass_with_valid(
         )
 
         refresh_bag(bag, bagging, n, i)
-        for r in range(n):
-            for k in range(n_classes):
-                prob[r * n_classes + k] = raw[r * n_classes + k]
-            _softmax_inplace(prob, r * n_classes, n_classes)
+        # PARALLEL. This ran as a serial per-row `_softmax_inplace` walk until
+        # 2026-08-18, when `boosting._softmax_rows` was measured at 1.21x on
+        # covertype -- and that change reached only `boosting.mojo`, leaving
+        # this copy and six others behind. Same helper, same guarantee: a
+        # row's softmax touches only that row's K slots, so the map is
+        # elementwise across rows and bit-identical at any task count.
+        _softmax_rows(raw, prob, n, n_classes)
 
         var grown = List[Tree](capacity=n_classes)
         var made_progress = False
