@@ -553,10 +553,11 @@ def _feature_gain(
     charged once rather than once per candidate: the split cost is a property
     of the node and the coupled and lazy costs are properties of the feature,
     so charging per candidate would multiply them by however many thresholds
-    the feature happens to offer. The order is LightGBM's: the multiplier
-    scales the gain, the CEGB costs are then subtracted as absolute amounts,
-    the monotone penalty discounts what is left, and `min_gain_to_split` is
-    the floor the result must clear.
+    the feature happens to offer. The order is LightGBM's, and CORRECTED on
+    2026-08-18 to actually be so: `min_gain_to_split` is the floor the RAW
+    gain must clear, and only what clears it is then scaled by the
+    multiplier, charged the CEGB costs, and discounted by the monotone
+    penalty. The floor is not re-applied afterwards.
 
     `cegb` is the node's costs, prepared once before this scan by
     `cegb.prepare_cegb_node`, so charging them here is one lookup and one
@@ -569,13 +570,31 @@ def _feature_gain(
     """
     if not extra_active:
         return gain
+    # THE FLOOR COMES FIRST, and it did not until 2026-08-18.
+    #
+    # LightGBM tests `min_gain_to_split` INSIDE the threshold scan, against
+    # the raw gain, before any cost is charged: `BeforeNumerical` folds it
+    # into `min_gain_shift` (feature_histogram.hpp:208) and every candidate is
+    # rejected on `current_gain <= min_gain_shift`. Only afterwards does it
+    # apply `feature_contri` (feature_histogram.hpp:175), subtract the CEGB
+    # delta (serial_tree_learner.cpp:997) and multiply the monotone penalty
+    # (serial_tree_learner.cpp:1004). There is no second floor downstream.
+    #
+    # We had the floor LAST, and the docstring above claimed that order was
+    # LightGBM's. It was exactly reversed. Inert unless
+    # `min_gain_to_split > 0` AND one of the three cost terms is active, but
+    # in that corner we rejected candidates LightGBM keeps -- a
+    # `feature_contri` of 0.5 halved the gain BEFORE the floor instead of
+    # after -- and under CEGB we rejected candidates LightGBM deliberately
+    # lets go negative, since a cost is meant to be able to make a split
+    # unattractive without making it illegal.
+    if not passes_min_gain(gain, extra.min_gain_to_split):
+        return 0.0
     var g = gain
     if penalize:
         g = extra.penalties.penalized_gain(g, feature)
     g = cegb.adjusted_gain_at(g, feature, node_rows)
     g = apply_monotone_penalty(g, sign, depth, extra.monotone_penalty)
-    if not passes_min_gain(g, extra.min_gain_to_split):
-        return 0.0
     return g
 
 

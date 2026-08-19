@@ -3575,8 +3575,24 @@ def grow_tree_leaves_profiled(
 
     # The root's own value is computed before its split search, because path
     # smoothing makes a candidate's children shrink toward it: it is the
-    # `parent_output` every candidate at the root is scored with. The root
-    # itself has no parent, so it smooths toward 0.0.
+    # `parent_output` every candidate at the root is scored with.
+    #
+    # **THE ROOT IS NOT SMOOTHED, corrected 2026-08-18.** It used to be
+    # computed with `path_smooth` active and `parent_output = 0.0`, i.e.
+    # shrunk toward zero, and the module that owns the formula recorded that
+    # as the one behavior it had not confirmed against LightGBM. It is now
+    # confirmed and it was wrong: `SerialTreeLearner::GetParentOutput`
+    # (serial_tree_learner.cpp:1013-1022) carries the comment "for root leaf
+    # the 'parent' output is its own output because we don't apply any
+    # smoothing to the root" and calls
+    # `CalculateSplittedLeafOutput<..., USE_SMOOTHING=false>`.
+    #
+    # Small in magnitude -- the factor is `w / (w + 1)` for
+    # `w = n_root / path_smooth`, about 0.9999 at 100k rows and
+    # `path_smooth = 10` -- and inert at the default `path_smooth = 0`. But
+    # the smoothed value propagated into the root's split search as
+    # `parent_output` and into `model_editing._parent_outputs` on refit, so
+    # it did not stay at the root.
     var root = tree._add_node(
         _leaf_value(
             root_hist,
@@ -3586,7 +3602,7 @@ def grow_tree_leaves_profiled(
             len(root_rows),
             0.0,
             max_delta_step,
-            path_smooth,
+            0.0,
         ),
         Float64(len(root_rows)),
     )
