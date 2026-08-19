@@ -2334,9 +2334,9 @@ until that document's status table says otherwise.
 
 ## Citing mojotrees
 
-If mojotrees contributes to work you publish, please cite it. GitHub renders
-[CITATION.cff](CITATION.cff) into a ready-made citation behind the **Cite this
-repository** button, and that file is the machine-readable source.
+If mojotrees is useful in work you publish, we would appreciate a citation.
+GitHub renders [CITATION.cff](CITATION.cff) into a ready-made reference behind
+the **Cite this repository** button.
 
     Hendel, A. (2026). mojotrees: Native gradient-boosted trees in Mojo
     (Version 0.1.0) [Computer software].
@@ -2348,7 +2348,7 @@ the citable identifier.
 
 ## License
 
-Apache-2.0, which carries an attribution obligation rather than waiving one.
-Section 4 requires anyone redistributing this code, modified or not, to retain
-the copyright and attribution notices, include the license, and reproduce the
-contents of [NOTICE](NOTICE). [AUTHORS.md](AUTHORS.md) records who holds what.
+Apache-2.0. Use it, fork it, ship it in a product, no permission needed. If
+you redistribute it, the license asks that you keep the copyright notices and
+pass along [LICENSE](LICENSE) and [NOTICE](NOTICE) with it.
+[AUTHORS.md](AUTHORS.md) records attribution.

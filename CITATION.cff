@@ -1,5 +1,5 @@
 cff-version: 1.2.0
-message: "If you use mojotrees, please cite the software and its creator."
+message: "If mojotrees is useful in your work, we would appreciate a citation."
 type: software
 title: "mojotrees: Native gradient-boosted trees in Mojo"
 authors:
