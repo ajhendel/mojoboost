@@ -567,8 +567,15 @@ CPU         AMD EPYC 9474F 48-core, NPROC reports 192
 GPU         AMD Instinct MI300X, gfx942, SKU MI3SRIOV (SR-IOV virtualized)
 ROCm        6.4.1-83
 Toolchain   Mojo 1.0.0 (ed45d567), pixi 0.77.0
-Commit      1b57950
+Commit      1b57950, INFERRED from push timing and not read from the run
 ```
+
+That last line is a defect in how this record was taken, not a hedge. The pod
+printed its commit and nobody kept the line, and the pod is gone. The commit
+is almost certainly `1b57950` because it was the head of `main` from 08:05 and
+this pod cloned at 08:06:40, but "almost certainly" is not what the other rows
+in this document mean. Any future run must capture the commit line into the
+record before the machine is destroyed.
 
 #### The result
 
