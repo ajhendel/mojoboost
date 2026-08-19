@@ -57,13 +57,18 @@ fi
 pixi --version || { say PIXI_FAILED; exit 1; }
 say PIXI_OK
 
-say CLONE
-cd /root
-rm -rf mojotrees
-git clone --depth 40 https://github.com/mojotrees/mojotrees.git >/dev/null 2>&1 || { say CLONE_FAILED; exit 1; }
-cd /root/mojotrees
+# NO CLONE. This script lives INSIDE a checkout, so it runs from the one it
+# was fetched with and works from there.
+#
+# It used to `rm -rf mojotrees` and re-clone, which deleted the file bash was
+# still reading and killed the run mid-flight with "No such file or
+# directory". A script that removes its own directory is a script that cannot
+# be re-run, and this one cost a paid NVIDIA pod eight minutes to learn that.
+say REPO
+cd "$(dirname "$0")/.." || { say REPO_FAILED; exit 1; }
+pwd
 git log --oneline -1
-say CLONE_OK
+say REPO_OK
 
 say BUILD
 timeout 1500 pixi run build-pkg > /root/build.log 2>&1
