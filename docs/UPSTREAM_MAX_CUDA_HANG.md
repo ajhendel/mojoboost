@@ -69,6 +69,28 @@ comptime, so the whole GPU half of a package compiles out and the build still
 exits 0. The same source on ROCm 6.4.1 works completely. A green build is not
 evidence the GPU path was compiled in, and nothing in the output said so.
 
+## It is not a regression in our code, and we checked
+
+The obvious question about any "your toolchain hangs" report is whether the
+reporter broke it themselves. We tested it rather than asserting it.
+
+`24077a6` is the first commit in this repository that had end-to-end GPU
+training, from 2026-08-14. Run on an RTX 4090 with driver 580.126.16 and the
+same `Mojo 1.0.0 (ed45d567)` that head resolves:
+
+```text
+MJT TRAINING rc=124 secs=601
+MJT VERDICT: HANG
+```
+
+The first GPU-training commit hangs exactly as head does. That commit pins the
+same `mojo` and `max` constraints and resolved the same toolchain build, so
+this compares our source and nothing else.
+
+This does not prove our design is right. It does mean there is no recent
+change to point at, and it means the behavior long predates the optimization
+work of the last week.
+
 ## How confident this is
 
 Stated before the evidence rather than after it, because the difference
