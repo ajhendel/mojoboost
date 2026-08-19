@@ -760,6 +760,50 @@ PHASE_D_OK  PHASE_E_OK  PHASE_F_OK  REPRO2_COMPLETED_NO_DEADLOCK
 So the runtime primitives are sound on this device and the deadlock requires
 something this repository does that they do not cover. It is ours.
 
+#### 2d. The trigger is Modular's kernel JIT, and it is not kernel count
+
+**Located, 2026-08-18.** `mojo build` compiles a hanging test in **31 seconds**
+and the resulting **binary** then hangs, so this is not the Mojo compiler and
+not the toolchain. A backtrace of that binary, with no compiler in the
+process, names the component:
+
+```text
+#5-7  libKGENCompilerRTShared.so     <- Modular's kernel-compiler RUNTIME
+#1-3  libcuda.so.1                   <- the NVIDIA driver
+#0    __futex_abstimed_wait_common64 <- blocked
+```
+
+14 threads on futexes, 3 in `poll`, GPU idle, zero CPU. `~/.nv/ComputeCache`
+holds **zero files** after a run, so nothing is cached and every process
+recompiles from scratch.
+
+**Kernel count is NOT the trigger.** `MOJOTREES_KERNEL_MATRIX_FULL = False`
+collapses the two histogram families from 40 instantiations to 12. Rebuilt at
+that setting, `test_gpu_training` and `test_device` both still hang at a 600s
+cap (rc=124, 600s and 601s). The matrix reduction was built precisely so this
+could be falsified rather than assumed, and it was falsified.
+
+**A methodological correction that invalidates earlier stacks.** The binary
+forks: the parent sits in `sigsuspend` and the child wedges on a futex. Every
+backtrace taken before 2026-08-18 23:00 was of the PARENT, which is merely
+waiting and is not stuck. Any conclusion drawn from those -- including the
+earlier reading that the deadlock was in `enqueueCreateBuffer` -- is
+unreliable. The child stack, captured with `follow-fork-mode child`, is what
+the frames above show.
+
+#### 2e. What is left, and it is upstream
+
+Eleven explanations are eliminated. Four MAX-only probes covering allocation,
+pinned buffers, copies, launches, queue depth, sub-buffers and concurrent
+device access from eight workers all pass. Reducing the kernel matrix changes
+nothing. What remains is a hang inside Modular's kernel-compiler runtime
+against the CUDA driver, and this repository cannot reach inside either.
+
+The next action is a bug report, not another experiment here. It has what one
+needs: a compiled binary that reproduces, a stack naming the component, exact
+versions (Mojo 1.0.0, driver 580.159.03, RTX 5090 sm_120), four probes proving
+the primitives are individually sound, and a falsified volume hypothesis.
+
 #### 2d. Candidates that remain, in the order worth testing
 
 1. **`create_sub_buffer`.** `GpuSplitSearcher.records_dev` owns `rec_i_dev`
