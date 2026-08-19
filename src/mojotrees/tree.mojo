@@ -2013,6 +2013,7 @@ def _search(
     cegb: CegbNodeCosts = CegbNodeCosts.inactive(),
     grower_applies_cegb: Bool = False,
     settings: DispatchSettings = DispatchSettings.unresolved(),
+    widths: List[Int] = [],
 ) raises -> SplitInfo:
     """Best split for one node. `allowed` is the node's interaction-constraint
     allow mask and `features` its subsampled feature ids; empty means every
@@ -2087,6 +2088,7 @@ def _search(
         parent_output=parent_output,
         cegb=cegb,
         settings=settings,
+        widths=widths,
         # CatBoost's `score_function`. `SCORE_L2` is the field's default and
         # is `find_best_split`'s, so a fit that does not name the parameter
         # makes the identical call it made before this argument was passed.
@@ -3636,6 +3638,7 @@ def grow_tree_leaves_profiled(
         cegb=root_costs,
         grower_applies_cegb=carries_cegb,
         settings=scratch.settings,
+        widths=scratch.widths,
     )
     # The scan reads one bin at a time over the node's own feature draw, so
     # its cells are that draw's width times `n_bins` and not the buffer's full
@@ -4124,6 +4127,7 @@ def grow_tree_leaves_profiled(
             cegb=left_costs,
             grower_applies_cegb=carries_cegb,
             settings=scratch.settings,
+            widths=scratch.widths,
         )
         profile.charge(
             PROF_SPLIT_SEARCH,
@@ -4170,6 +4174,7 @@ def grow_tree_leaves_profiled(
             cegb=right_costs,
             grower_applies_cegb=carries_cegb,
             settings=scratch.settings,
+            widths=scratch.widths,
         )
         profile.charge(
             PROF_SPLIT_SEARCH,

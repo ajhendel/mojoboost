@@ -601,9 +601,34 @@ def find_best_split(
     cegb: CegbNodeCosts = CegbNodeCosts.inactive(),
     settings: DispatchSettings = DispatchSettings.unresolved(),
     score_function: Int = SCORE_L2,
+    widths: List[Int] = [],
 ) raises -> SplitInfo:
     """Scan all (feature, bin) split candidates and return the one with the
-    highest gain. `lambda_reg` is the L2 penalty on the leaf hessian sum and
+    highest gain.
+
+    **`widths[f]` is feature f's realized bin count**, from
+    `binning.histogram_widths`, cached fit-scoped on `GrowScratch`. It does
+    two things, and only one of them is bit-identical.
+
+    THE ACCURACY FIX, and it is a real behavior change. `extra_trees` draws
+    one threshold per feature uniformly from the candidate space. That space
+    was the RECTANGLE: on covertype, where 44 of 54 features have exactly two
+    bins against a 255-bin budget, a binary feature drew from 254 candidates
+    and hit its single real threshold with probability 1/254. The other 253
+    draws put every row on one side, which `min_data_in_leaf` then rejects, so
+    the feature offered no split at all. `extra_trees` was very nearly a
+    no-op on low-cardinality data. Drawing from the realized width is what
+    LightGBM does by construction, because its histogram is ragged and its
+    per-feature bin count IS the realized one.
+
+    THE SPEED BOUND, which is bit-identical and gated. Trailing bins add
+    exactly `0.0` and `0` to the running left sums, so every candidate above
+    `w - 1` has a BITWISE identical gain to the one at `w - 1`, and the strict
+    `>` comparison in ascending bin order keeps the lower index. Truncating
+    therefore retains exactly the candidate that would have won. That argument
+    needs no appeal to `min_data_in_leaf` -- except in the noisy case, where
+    an accepted candidate gets per-bin noise, and there the rejection is what
+    keeps a dead bin from being accepted at all. `lambda_reg` is the L2 penalty on the leaf hessian sum and
     `lambda_l1` the L1 penalty soft-thresholding every gradient sum. Only
     splits with positive gain are returned as found.
 
@@ -1034,6 +1059,19 @@ def find_best_split(
         # Ordinary bins are [0, n_scan); the missing bin sits at n_scan and is
         # never a threshold, only a side to route.
         var n_scan = missing_bin if missing_bin >= 0 else hist.n_bins
+
+        # The realized width, and the two things it is used for below.
+        #
+        # `missing_bin[f]` is already the ordinary width when a feature
+        # reserves one (`binning` sets it to `n_edges + 1` and ordinary bins
+        # are `0..n_edges`), so `n_scan` is tight there and this changes
+        # nothing. The whole effect is on features with NO missing bin, where
+        # `n_scan` is the full rectangle.
+        var n_lim = n_scan
+        if len(widths) == hist.n_features:
+            var w = widths[f]
+            if w < n_lim:
+                n_lim = w
         var miss_g = 0.0
         var miss_h = 0.0
         var miss_c = 0
@@ -1048,7 +1086,10 @@ def find_best_split(
         # child, and a feature that offers no candidate offers no split.
         var pick = -1
         if draw_one:
-            var n_candidates = n_scan if miss_c > 0 else n_scan - 1
+            # THE REALIZED width, not the rectangle. See the `widths`
+            # paragraph on this function: drawing from 254 candidates when 2
+            # exist made `extra_trees` a near no-op on low-cardinality data.
+            var n_candidates = n_lim if miss_c > 0 else n_lim - 1
             pick = extra_threshold_index(
                 n_candidates, extra.extra_seed, tree_index, node, f
             )
@@ -1058,9 +1099,32 @@ def find_best_split(
         var left_g = 0.0
         var left_h = 0.0
         var left_c = 0
-        for b in range(n_scan):
+        # BIT-IDENTICAL, and the argument does not rest on the minima.
+        # Every candidate above `n_lim - 1` accumulates only `x + 0.0` and
+        # `c + 0`, so its gain is BITWISE equal to the candidate at
+        # `n_lim - 1`, and the strict `>` in ascending bin order keeps the
+        # lower index. Truncating retains exactly the winner.
+        #
+        # The exception is noise. `random_strength` adds a per-bin draw INSIDE
+        # the accepted branch, so a dead candidate that is ACCEPTED would get
+        # its own noise and could win. `min_data_in_leaf >= 1` is what stops
+        # that: at `b >= n_lim - 1` with no missing bin, `total_c - left_c` is
+        # exactly integer 0 and the guard rejects before any gain is formed.
+        # Integer, so it is exact -- `min_child_hess` is NOT a substitute,
+        # because `total_h - left_h` is a float residue of two summation
+        # orders rather than a true zero.
+        var scan_to = n_scan
+        if (
+            n_lim < n_scan
+            and not draw_one
+            and (extra.random_strength <= 0.0 or min_data_in_leaf >= 1)
+        ):
+            scan_to = n_lim
+        for b in range(scan_to):
             # The top threshold puts every ordinary bin left, so it is only a
             # split at all when missing rows are there to fill the right child.
+            # Spelled against `n_scan`: when the loop is bounded below it this
+            # is dead, and when it is not it is live. Either way unchanged.
             if b == n_scan - 1 and miss_c == 0:
                 break
             left_g += hist.grad_at(base + b)
