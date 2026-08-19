@@ -170,6 +170,7 @@ probe-cuda-alloc = "bash tools/with_timeout.sh auto mojo run probes/cuda_deadloc
 probe-cuda-launch = "bash tools/with_timeout.sh auto mojo run probes/cuda_deadlock_launch.mojo"
 probe-cuda-subbuffer = "bash tools/with_timeout.sh auto mojo run probes/cuda_deadlock_subbuffer.mojo"
 probe-cuda-parallel = "bash tools/with_timeout.sh auto mojo run probes/cuda_deadlock_parallel.mojo"
+probe-cuda-variety = "bash tools/with_timeout.sh auto mojo run probes/cuda_deadlock_kernel_variety.mojo"
 
 [dependencies]
 mojo = ">=1.0.0,<2"
