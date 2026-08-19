@@ -1398,6 +1398,19 @@ struct _RowPool(Movable):
         """Return a buffer so its capacity survives into the next node."""
         self.free.append(rows^)
 
+    def reach_report(self) -> String:
+        """`made` and `served`, so the counters have a reader.
+
+        An audit on 2026-08-18 found that the instrument installed to prove
+        this pool works had no consumer anywhere in the repository -- the
+        check written to catch an inert pool was itself inert. This is that
+        consumer. A healthy pool has `made` plateau within the first few
+        trees while `served` climbs with every node.
+        """
+        return String(
+            "rows_pool made=", self.made, " served=", self.served
+        )
+
 
 struct _HistPool(Movable):
     """Free-list of histogram buffers of one shape.
@@ -2887,6 +2900,16 @@ def _grow_oblivious_levels(
             var branch = List[Int]()
             if constrained:
                 branch = extend_branch(frontier[i].branch, split.feature)
+
+            # The parent's row list, back to the pool. The leaf-wise grower
+            # has done this since the pool was fixed; this path never did, so
+            # the pool served the oblivious grower's takes and got nothing
+            # back except the final drain. Per depth-6 tree that dropped 63
+            # buffers including the root's, which is the largest one there is.
+            #
+            # This is the SHIPPED CatBoost-mode default path, so the pool was
+            # inert exactly where the symmetric arm is slowest.
+            scratch.rows_pool.give(frontier[i].take_rows())
 
             # No per-leaf split is searched in this mode, so the field stays
             # "none" rather than carrying a number no consumer may read.
