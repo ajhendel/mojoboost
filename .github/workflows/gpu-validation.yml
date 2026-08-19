@@ -39,7 +39,7 @@ jobs:
     runs-on: [self-hosted, linux, gpu, cuda]
     timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: prefix-dev/setup-pixi@v0.10.1
         with:
@@ -82,7 +82,7 @@ jobs:
       - name: Validation report
         run: pixi run gpu-validate ${{ inputs.rounds }} | tee gpu-validation.txt
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: gpu-validation-nvidia
@@ -94,7 +94,7 @@ jobs:
     runs-on: [self-hosted, linux, gpu, rocm]
     timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: prefix-dev/setup-pixi@v0.10.1
         with:
@@ -131,7 +131,7 @@ jobs:
       - name: Validation report
         run: pixi run gpu-validate ${{ inputs.rounds }} | tee gpu-validation.txt
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: gpu-validation-amd

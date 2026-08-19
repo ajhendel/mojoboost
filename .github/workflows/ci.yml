@@ -17,7 +17,7 @@ jobs:
         runner: [ubuntu-latest, ubuntu-24.04-arm]
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: prefix-dev/setup-pixi@v0.10.1
         with:
           cache: true
@@ -31,7 +31,7 @@ jobs:
       # after install, before anything has been compiled, so every run
       # without this step is fully cold.
       - name: Mojo compile cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: .pixi/envs/default/share/max/cache
           key: mojo-cache-${{ matrix.runner }}-${{ hashFiles('pixi.lock') }}-${{ hashFiles('src/**/*.mojo', 'tests/**/*.mojo') }}
@@ -59,7 +59,7 @@ jobs:
         runner: [ubuntu-latest, ubuntu-24.04-arm]
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: prefix-dev/setup-pixi@v0.10.1
         with:
           cache: true
@@ -75,7 +75,7 @@ jobs:
   parity:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Parity contract
         run: python3 tools/check_parity.py
 
@@ -97,7 +97,7 @@ jobs:
   api-snapshot:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: API snapshot
         run: python3 tools/api_snapshot.py --check
 
@@ -108,7 +108,7 @@ jobs:
   pixi-tasks:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: pixi task manifest
         run: python3 tools/check_pixi_tasks.py
 
@@ -132,7 +132,7 @@ jobs:
   connectivity-audit:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Connectivity audit
         run: python3 tools/connectivity_audit.py
       - name: Integration inventory audit
@@ -149,7 +149,7 @@ jobs:
         runner: [ubuntu-latest, ubuntu-24.04-arm]
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: prefix-dev/setup-pixi@v0.10.1
         with:
           cache: true
