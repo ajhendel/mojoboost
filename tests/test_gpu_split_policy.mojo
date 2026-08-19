@@ -52,10 +52,16 @@ from mojotrees.gpu_split_policy import (
     SPLIT_REASON_UNKNOWN_HARDWARE,
     SPLIT_REASON_UNSUPPORTED,
     SPLIT_REASON_VALIDATED_WORKLOAD,
+    SPLIT_DEVICE_APPLE_M4,
+    SPLIT_DEVICE_UNVALIDATED,
     SplitSearchDecision,
     decide_split_search,
     normalized_split_work,
+    split_device_evidence,
+    split_device_is_validated,
+    split_device_note,
     split_reason_name,
+    validated_split_device,
 )
 
 
@@ -141,14 +147,20 @@ def test_eligibility_still_gates_and_reports_its_own_reason() raises:
 
 
 def test_unmeasured_hardware_still_stays_on_the_host() raises:
-    """`_is_observed_m4` survives the threshold it used to scope.
+    """The validated-device table survives the threshold it used to scope.
 
     It looks like the hardware scope of a deleted rule and is not. The sweep
-    ran on one machine, and nothing in this repository has ever run the
-    device split search on CUDA or HIP (`docs/GPU_VALIDATION.md` reads "not
-    run" for both). Routing unmeasured hardware to the device arm on the
-    strength of an M4 measurement would install a performance claim about a
-    machine nobody owns.
+    ran on one machine, and routing unmeasured hardware to the device arm on
+    the strength of an M4 measurement would install a performance claim about
+    a machine nobody owns.
+
+    CUDA is the interesting case since 2026-08-18, because it stopped being
+    hypothetical: an RTX 5090 executed this code and passed 66 GPU
+    assertions. It is still not in the validated table, because correctness
+    is not a crossover and no host-against-device sweep has been taken on it.
+    Asserted here so that a future session which reads the correctness result
+    and promotes the device on the strength of it has to delete a test that
+    says why not.
 
     Asserted at a large shape and a small one, because if this ever became a
     size question it would have stopped being this.
@@ -163,6 +175,52 @@ def test_unmeasured_hardware_still_stays_on_the_host() raises:
         "cuda", "sm_90", 1_000, 100, 255, 31, True, True
     )
     assert_equal(small_cuda.reason, SPLIT_REASON_UNKNOWN_HARDWARE)
+
+
+def test_the_validated_table_holds_one_row_and_cites_it() raises:
+    """A row exists only with a citable measurement behind it.
+
+    The table replaced a boolean on 2026-08-19. The property worth pinning is
+    not which devices are in it -- that is data and is meant to change -- but
+    that membership and evidence cannot come apart: anything the table calls
+    validated must name the record that put it there, and anything outside it
+    must claim no evidence at all.
+    """
+    var m4 = validated_split_device("metal", "4-metal4")
+    assert_equal(m4, SPLIT_DEVICE_APPLE_M4)
+    assert_true(split_device_is_validated("metal", "4-metal4"))
+    assert_true(split_device_evidence(m4).find("2026-08-16") >= 0)
+
+    assert_equal(
+        validated_split_device("cuda", "sm_120"), SPLIT_DEVICE_UNVALIDATED
+    )
+    assert_false(split_device_is_validated("cuda", "sm_120"))
+    assert_equal(split_device_evidence(SPLIT_DEVICE_UNVALIDATED), String("none"))
+
+
+def test_the_three_unvalidated_states_read_differently() raises:
+    """"Not validated" is one route and three different situations.
+
+    A backend that has never run, a backend that runs and has not been
+    measured, and a Metal part that is not the measured generation all take
+    the host scan. They are the same decision and they are not the same fact,
+    and the reason a reader is handed has to tell them apart or the next
+    session repeats the work that has already been done.
+    """
+    var cuda = split_device_note("cuda", "sm_120")
+    var hip = split_device_note("hip", "gfx1100")
+    var m3 = split_device_note("metal", "3-metal3")
+
+    assert_true(cuda.find("66 GPU") >= 0)
+    assert_true(hip.find("has ever executed") >= 0)
+    assert_true(m3.find("not the validated M4") >= 0)
+
+    # The point of the function: no two of them say the same thing.
+    assert_false(cuda == hip)
+    assert_false(cuda == m3)
+    assert_false(hip == m3)
+
+    assert_true(split_device_note("metal", "4-metal4").find("validated on") == 0)
 
 
 def test_growth_policy_is_reported_and_decides_nothing() raises:

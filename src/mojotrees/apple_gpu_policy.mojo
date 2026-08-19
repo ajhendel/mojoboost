@@ -172,7 +172,7 @@ comptime OBSERVED_M4_SHARED_BYTES = 32768
 # MEASURED, 2026-08-16: `DeviceContext().arch_name()` on the development M4
 # returns exactly `4-metal4`, and `std.sys.info._accelerator_arch()` on a
 # build targeting it returns `metal:4-metal4`. Both were read, not recalled;
-# `gpu_split_policy._is_observed_m4` had already hardcoded the same literal
+# `gpu_split_policy.validated_split_device` had already hardcoded the literal
 # for the same reason and from the same reading.
 #
 # It is a constant rather than a pattern because one reading is all this

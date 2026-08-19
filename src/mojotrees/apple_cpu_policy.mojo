@@ -103,7 +103,7 @@ larger, and raising the constant would widen the interleave a rung at 255
 bins. Two things stop it. The number is not read from any API this project
 calls, so raising it would replace a stated assumption with a remembered
 figure; and there is no CPU equivalent of the device report that
-`gpu_split_policy._is_observed_m4` guards its hardware-specific threshold
+`gpu_split_policy.validated_split_device` guards its hardware-specific rule
 with, because nothing portable in `std.sys.info` identifies the part. Guessing
 the part from core counts is exactly the per-chip table the section above
 refuses. So the floor stands, the ladder is selected against it, and

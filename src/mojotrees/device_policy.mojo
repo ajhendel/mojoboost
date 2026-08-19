@@ -2080,8 +2080,8 @@ def crossover_rules() raises -> List[CrossoverEvidence]:
       are `not run`). An M3 or an M5 shares neither the core count nor the
       synchronization costs the round was tuned against, and a rule that
       inherited to them would be a performance claim about hardware nobody
-      owns. `gpu_split_policy._is_observed_m4` draws the same line and for
-      the same reason.
+      owns. `gpu_split_policy.validated_split_device` draws the same line
+      and for the same reason.
     - `objective`. The record's target is a synthetic regression; squared
       error is the objective both arms ran. Other objectives differ in
       where their gradients are computed, and
@@ -2828,7 +2828,7 @@ def _collect_warnings(
     # THE SPLIT SEARCH FALLS BACK ON HARDWARE THAT IS NOT THE VALIDATED M4,
     # AND UNTIL 2026-08-18 NOBODY WAS TOLD.
     #
-    # `gpu_split_policy._is_observed_m4` gates the device-resident split search
+    # `gpu_split_policy.validated_split_device` gates the device-resident search
     # on an Apple M4, because that is the only device whose crossover has been
     # measured. Every other GPU is routed to the host scan, and that route
     # costs twice over: it is measured 1.29x to 1.85x SLOWER at every shape
@@ -2858,8 +2858,8 @@ def _collect_warnings(
     # The first version was Metal-only, on the reasoning that the 1.29x-1.85x
     # slowdown was measured on Metal and a one-backend number should not be
     # stated as a general property. That reasoning was right about the SPEED
-    # and wrong about the SILENCE. `_is_observed_m4` requires both the Metal
-    # api and the M4 generation, so a CUDA or HIP device fails it too and
+    # and wrong about the SILENCE. The validated-device table requires both the
+    # Metal api and the M4 generation, so a CUDA or HIP device misses it too and
     # takes the host scan exactly as an M3 does -- and the host scan does not
     # produce the same model as the device scan on ANY backend, because the
     # two differ in precision and in when they dequantize. That part is not a
