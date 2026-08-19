@@ -139,15 +139,24 @@ The view was built by `BinMapper.transform`, before bundling exists.
 Rebuilding the view over the bundles, covtype, 30 trees, one window,
 bit-identical across every arm:
 
-| arm | median |
-|---|---|
-| bundle + row-major (12-byte records) | **6.950 s** |
-| bundle, feature-major | 7.842 s |
+Four arms, one window, three repeats, bit-identical across every arm,
+covtype 30 trees:
 
-**1.13x for the layout, on top of what bundling already gives.** The third arm
-in that run was mislabelled: it forced `MOJOTREES_CPU_ROW_MAJOR=0`, so it is
-not the shipped default and no ratio against it is quoted here. The honest
-comparison against the shipped default still needs a four-arm run.
+| arm | median | min | max | vs default |
+|---|---|---|---|---|
+| shipped default | 7.929 s | 7.655 | 8.158 | |
+| bundle, auto layout | 6.817 s | 6.759 | 6.882 | **1.163x, disjoint** |
+| bundle, force row-major | 6.786 s | 6.680 | 6.894 | **1.168x, disjoint** |
+| bundle, force feature-major | 7.066 s | 6.924 | 7.094 | 1.122x, disjoint |
+
+**Bundling is worth 1.122x and the row-major layout adds 1.041x on top of it**
+(7.066 against 6.786, and those two ranges are disjoint by 30 ms, which is
+thin). `auto` already selects row-major, so the shipped path needs no switch.
+
+**An earlier three-arm run put the layout's share at 1.13x and that was
+wrong.** Its feature-major arm set `MOJOTREES_CPU_ROW_MAJOR=0`, which also
+disables the compact private accumulator, so it measured two changes and
+attributed both to one. The four-arm number above supersedes it.
 
 **Do not read this as the density diagnosis being revived.** See below.
 
