@@ -2352,3 +2352,7 @@ Apache-2.0. Use it, fork it, ship it in a product, no permission needed. If
 you redistribute it, the license asks that you keep the copyright notices and
 pass along [LICENSE](LICENSE) and [NOTICE](NOTICE) with it.
 [AUTHORS.md](AUTHORS.md) records attribution.
+
+This project is not operated or endorsed by Modular, Inc.
+
+MAX (R) and Mojo (R) are trademarks of Modular, Inc. used under license.
