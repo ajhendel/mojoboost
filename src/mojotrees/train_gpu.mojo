@@ -284,6 +284,11 @@ is widened.
 
 from std.math import log, min
 from std.os import getenv
+
+# Wired 2026-08-19 for the packed-bins arm below. `set_packed_bins` needs a
+# per-feature width table and deriving one by hand is the documented way to
+# corrupt a dataset silently, since a truncated bin id is a legal bin id.
+from .gpu_packed_bins import packed_widths_from_matrix
 from std.sys import has_accelerator
 from std.time import perf_counter_ns
 from max.gpu.host import DeviceContext
@@ -5108,6 +5113,7 @@ def train_gpu(
     split_search: Int = SPLIT_SEARCH_AUTO,
     row_unroll: Bool = True,
     row_compaction: Bool = False,
+    packed_bins: Bool = False,
     narrow_index: Bool = False,
     pair_alignment: Bool = True,
     min_tiles: Int = 0,
@@ -5301,6 +5307,32 @@ def train_gpu(
         builder.rows.set_row_compaction(
             row_compaction or builder.rows.row_compaction_requested()
         )
+        # PACKED BINS, wired 2026-08-19 because it was NOT.
+        #
+        # `GpuActiveRows.set_packed_bins` was built, documented, and refuses
+        # every bad configuration carefully, and nothing in `src/`, `tests/`
+        # or `bench/` ever called it. It is the fifth stage in this repository
+        # found fully implemented and unreachable, and an unreachable arm
+        # cannot be measured, which is the only thing that would settle it.
+        #
+        # Why it is worth reaching. CatBoost's compressed index packs by
+        # cardinality, 32 binary features to a UInt32, and our bin matrix
+        # spends a whole byte on a feature with two bins. Against their 480 MB
+        # a tree we read 3.9 GB, and this is the arm that narrows the cell
+        # rather than rearranging it. Its own docstring says the reference
+        # shape this project benchmarks, 1M x 50 at 255 bins, GAINS NOTHING,
+        # because all-width-8 is the identity and is refused. covtype, whose
+        # 54 columns are mostly binary indicators, is the shape that gains,
+        # and it is the shape this arm has never been run on.
+        #
+        # OFF unless asked. `packed_widths_from_matrix` costs a full
+        # `n_rows * n_features` host pass, so it is not paid by a fit that did
+        # not request the layout. The `or` follows `set_row_compaction`
+        # exactly, and for the reason recorded above it: a parameter
+        # defaulting off must not out-rank an explicit environment request,
+        # which is the bug that made the compaction arm silently inert.
+        if packed_bins or getenv("MOJOTREES_GPU_PACKED_BINS") == "1":
+            builder.rows.set_packed_bins(packed_widths_from_matrix(data))
         # The three hist-latency arms, on the same footing and for the same
         # reason: a launch shape reachable in the call so a benchmark can
         # interleave arms in one process. None can change a model. The index
@@ -5348,6 +5380,7 @@ def train_gpu(
     split_search: Int = SPLIT_SEARCH_AUTO,
     row_unroll: Bool = True,
     row_compaction: Bool = False,
+    packed_bins: Bool = False,
     narrow_index: Bool = False,
     pair_alignment: Bool = True,
     min_tiles: Int = 0,
@@ -5468,6 +5501,32 @@ def train_gpu(
         builder.rows.set_row_compaction(
             row_compaction or builder.rows.row_compaction_requested()
         )
+        # PACKED BINS, wired 2026-08-19 because it was NOT.
+        #
+        # `GpuActiveRows.set_packed_bins` was built, documented, and refuses
+        # every bad configuration carefully, and nothing in `src/`, `tests/`
+        # or `bench/` ever called it. It is the fifth stage in this repository
+        # found fully implemented and unreachable, and an unreachable arm
+        # cannot be measured, which is the only thing that would settle it.
+        #
+        # Why it is worth reaching. CatBoost's compressed index packs by
+        # cardinality, 32 binary features to a UInt32, and our bin matrix
+        # spends a whole byte on a feature with two bins. Against their 480 MB
+        # a tree we read 3.9 GB, and this is the arm that narrows the cell
+        # rather than rearranging it. Its own docstring says the reference
+        # shape this project benchmarks, 1M x 50 at 255 bins, GAINS NOTHING,
+        # because all-width-8 is the identity and is refused. covtype, whose
+        # 54 columns are mostly binary indicators, is the shape that gains,
+        # and it is the shape this arm has never been run on.
+        #
+        # OFF unless asked. `packed_widths_from_matrix` costs a full
+        # `n_rows * n_features` host pass, so it is not paid by a fit that did
+        # not request the layout. The `or` follows `set_row_compaction`
+        # exactly, and for the reason recorded above it: a parameter
+        # defaulting off must not out-rank an explicit environment request,
+        # which is the bug that made the compaction arm silently inert.
+        if packed_bins or getenv("MOJOTREES_GPU_PACKED_BINS") == "1":
+            builder.rows.set_packed_bins(packed_widths_from_matrix(data))
         # The same three arms the session-free overload sets, from the same
         # arguments. A session owns the context, not the geometry, so it
         # cannot change these answers either.
