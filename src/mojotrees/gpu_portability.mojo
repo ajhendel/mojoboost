@@ -94,6 +94,13 @@ from .apple_gpu_policy import (
     GpuProfile,
     api_name,
 )
+from .backend_matrix import (
+    BackendPolicy,
+    capabilities_for,
+    identity_mode_requested,
+    matrix_is_reachable,
+    policy_for,
+)
 from .gpu_backend_policy import (
     SUPPORT_EXERCISED,
     backend_support,
@@ -262,7 +269,7 @@ struct BackendContract(Copyable, Movable):
 
 
 def contract_for(api: Int) raises -> BackendContract:
-    """The contract for one backend.
+    """The contract for one backend, read from `backend_matrix`.
 
     Raises for an API code outside the covered set, which is the clear
     failure an unsupported build or a mis-plumbed backend code deserves.
@@ -276,23 +283,62 @@ def contract_for(api: Int) raises -> BackendContract:
     use all five unconditionally on every device MAX opens, and Metal
     demonstrates that at least one real device honors them. Setting them
     False for the unknown backend would refuse the path that ships today.
+
+    **Changed 2026-08-19.** Every field except `unified_memory` and
+    `support` used to be the same literal here for every API, which made this
+    a floor rather than a table. The values now come from
+    `backend_matrix.capabilities_for`, and `device_float64_permitted` comes
+    from `backend_matrix.policy_for`, so a backend that has Float64 is no
+    longer refused it by Apple's absence of it. Under identity mode the
+    policy pins that row back to the floor, and the geometry rows stay
+    per-backend either way. See `docs/GPU_PORTABILITY.md`.
+
+    Behavior on the shipping path is unchanged, and that is not an accident
+    of care but a consequence of plumbing: `API_UNKNOWN` is what every launch
+    carries, its column is the derived floor, and the floor is what the old
+    literals spelled. `matrix_is_reachable` is the predicate that says so.
     """
     require_backend_covered(api)
+    var caps = capabilities_for(api)
+    var policy = policy_for(api, identity_mode_requested())
+    if caps.grid_axes != GRID_AXES:
+        raise Error(
+            "backend_matrix.GRID_AXES mirrors this module's GRID_AXES and has"
+            " drifted from it: matrix says ",
+            caps.grid_axes,
+            ", this module says ",
+            GRID_AXES,
+            ". The mirror exists because gpu_portability imports"
+            " backend_matrix and the reverse would be a cycle; fix the copy,"
+            " do not delete this check",
+        )
     return BackendContract(
         api,
         backend_support(api),
-        0,
-        WARP_GRANULARITY,
-        MAX_GRID_DIM_Y,
-        GRID_AXES,
-        True,
-        True,
-        True,
-        True,
-        True,
-        False,
-        api == API_METAL,
+        caps.subgroup_width,
+        caps.launch_granularity,
+        caps.max_grid_dim_y,
+        caps.grid_axes,
+        caps.threadgroup_barrier,
+        caps.shared_static_alloc,
+        caps.shared_int32_atomic_add,
+        caps.global_int32_atomic_add,
+        caps.in_order_queue,
+        policy.emit_float64,
+        caps.api_implies_unified_memory,
     )
+
+
+def policy_in_force(api: Int) raises -> BackendPolicy:
+    """The policy column `contract_for` used, exposed for diagnostics.
+
+    A caller that wants to record *why* a contract looks the way it does
+    wants this rather than the contract: the contract is the result, and this
+    is the decision that produced it, including whether identity mode was
+    requested and whether the matrix was reachable at all.
+    """
+    require_backend_covered(api)
+    return policy_for(api, identity_mode_requested())
 
 
 def contract_from_profile(profile: GpuProfile) raises -> BackendContract:
@@ -329,6 +375,8 @@ def describe_contract(contract: BackendContract) -> String:
         _bool_text(contract.device_float64_permitted),
         " unified=",
         _bool_text(contract.unified_memory),
+        " matrix_reachable=",
+        _bool_text(matrix_is_reachable(contract.api)),
     )
 
 
@@ -431,15 +479,21 @@ def require_specializations_allowed(
 
 
 def require_device_float64(contract: BackendContract) raises:
-    """Refuse Float64 device arithmetic.
+    """Refuse Float64 device arithmetic where the policy has not permitted it.
 
-    Every backend, unconditionally, and it is a function rather than a
-    comment so a future Float64 specialization has one place to be gated
-    from. Apple silicon has no Float64 and one source targets all three
-    backends, so the shared kernels carry Float32 gradients and fixed-point
-    Int32 accumulation everywhere. A backend that has Float64 may only use
-    it behind a variant that reproduces the fixed-point integers exactly,
-    and that variant does not exist.
+    It is a function rather than a comment so the decision has exactly one
+    place to be made, and as of 2026-08-19 that decision is no longer a
+    constant. `backend_matrix.policy_for` sets
+    `device_float64_permitted` from the backend's own capability, so a card
+    that has Float64 is no longer refused it because Apple silicon lacks it.
+    Under identity mode (`MOJOTREES_BIT_IDENTITY=1`) the numeric rows pin back
+    to the portable floor and this refuses again on every backend.
+
+    Two things a caller should know before reaching for it. The shipping
+    kernels carry Float32 gradients and fixed-point Int32 accumulation, which
+    is both faster than Float64 and exact, so there is no histogram precision
+    to recover here. And no Float64 kernel variant exists yet: this gate
+    permitting the arithmetic is not the same as a variant being written.
     """
     if contract.device_float64_permitted:
         return

@@ -770,6 +770,56 @@ hang follows from it.
 This is recorded at length because the hypothesis was one decision away from
 being sent to Modular as a claim about their runtime.
 
+### The hang is not a regression: 2026-08-19 bisect probe
+
+Andrew asked the question this record had never tested: **what if one of our
+own commits is simply bad?** Every CUDA run to that point had been at or near
+head, so a defect introduced at any time in this repository's history would
+look exactly like what we were seeing, and we would have been blaming a
+toolchain for our own change.
+
+The probe is the oldest commit that has end-to-end GPU training at all.
+
+```text
+Commit      24077a6  "End-to-end GPU training: device-resident tree growth
+                      via leaf ids", 2026-08-14, the first of its kind
+GPU         NVIDIA GeForce RTX 4090, sm_89
+Driver      580.126.16     VERIFIED above MAX's floor of 580, gated in-script
+Toolchain   Mojo 1.0.0 (ed45d567), IDENTICAL to head
+```
+
+```text
+MJT TRAINING rc=124 secs=601
+MJT VERDICT: HANG
+```
+
+**The first GPU-training commit in this project's history hangs the same way
+head does.** The behavior is not a regression from any optimization lane, and
+it was invisible for five days for the reason every CUDA finding here has
+been invisible: `has_accelerator()` is comptime, so before 2026-08-18 no build
+anywhere contained the GPU branch on a non-Apple machine.
+
+**Why the toolchain is not a confound.** `24077a6` carries its own
+`pixi.toml`, and it pins `mojo >=1.0.0,<2` and `max >=26.5.0,<27` -- the same
+constraints as head -- and resolved to the same `Mojo 1.0.0 (ed45d567)`. A
+bisect across this repository therefore measures our source and nothing else.
+Had the old commit resolved a different MAX, this result would have been
+uninterpretable.
+
+**It also repairs the RTX 4090 record above.** That earlier run never captured
+its driver, so its hang could not be quoted against a supported configuration.
+This one gated on the driver before doing anything, verified 580.126.16, and
+hung. Ada at sm_89 on a supported driver hangs, and that is now a reading
+rather than an assumption.
+
+**What it does NOT establish.** That this repository is blameless. It rules
+out a recent regression, not a design that was wrong from the first GPU
+commit. The argument against that reading is not in this section: it is that
+the same design completes on HIP in 63 seconds.
+
+**Cost of the answer:** one pod, about eleven minutes, roughly fourteen cents.
+The question was worth far more than that and nobody had asked it.
+
 ### Apple M4, Metal, 2026-08-19: the kernel-variety control
 
 Run on the development M4 as the CONTROL for the NVIDIA hang, not as a
