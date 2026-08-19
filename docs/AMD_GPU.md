@@ -65,6 +65,40 @@ device, that clamp is CUDA's limit being applied to a device that does not
 have it. It is a deliberate consequence of one source and would need a
 per-backend bound, read from the device rather than assumed, to lift.
 
+## The single most valuable thing a first AMD run can produce
+
+Added 2026-08-19, after NVIDIA. **No AMD hardware has run this code and none
+of what follows is a result.**
+
+An RTX 5090 executed this source on 2026-08-18 and passed 66 GPU assertions,
+and one class of work never returned: a full training fit parks with the GPU
+idle and the blocked thread inside `libKGENCompilerRTShared` calling into
+`libcuda`. The write-up is `docs/UPSTREAM_MAX_CUDA_HANG.md`, and the honest
+summary of it is that we cannot tell whether the fault is Modular's or ours.
+
+A first HIP run answers that question almost for free, and it answers it
+either way:
+
+- **If a training fit hangs on AMD too**, in MAX's kernel-compiler runtime
+  against `libamdhip64` rather than `libcuda`, then the failure is not
+  vendor-specific and the upstream report gets much stronger. Two backends is
+  a pattern.
+- **If a training fit completes on AMD**, then whatever is happening is
+  specific to the CUDA path, and the search narrows to what differs there.
+  That is nearly as useful and it is a better outcome.
+
+So the ordering advice for a first AMD run is inverted from what it would
+otherwise be. Do not start with a benchmark, and do not even start with the
+full correctness suite. Build the package, run the four probes
+(`pixi run probe-cuda-alloc` and its three siblings, which are named for
+CUDA because that is where they were written and which import nothing
+vendor-specific), then run one training fit under
+`bash tools/with_timeout.sh 600`. Those four commands are worth more than a
+day of sweeps.
+
+Everything else on this page still applies and is the right guide once that
+question is settled.
+
 ## The things to look at first
 
 1. **Threadgroup memory, called LDS here.** The shipping histogram kernels
