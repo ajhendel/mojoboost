@@ -7,12 +7,15 @@ else's harness is that our arm is configured the way theirs is and not the
 way we would have chosen. Where a parameter has no mojotrees equivalent the
 difference is recorded in `PARITY_NOTES` rather than silently dropped.
 
-Two arms are registered.
+Three arms are registered.
 
   mojotrees-cpu   device="cpu", the oracle path
   mojotrees-gpu   device="gpu", explicit rather than "auto" so a run that
                   cannot reach the accelerator fails loudly instead of
                   quietly reporting a CPU number under a GPU label
+  mojotrees-gpu-compact
+                  the same GPU arm with row compaction on, so the two can be
+                  interleaved inside one process against the drift
 """
 
 import os
@@ -118,6 +121,35 @@ class MojoTreesCPUAlgorithm(MojoTreesAlgorithm):
 
 class MojoTreesGPUAlgorithm(MojoTreesAlgorithm):
     device = "gpu"
+
+
+class MojoTreesGPUCompactAlgorithm(MojoTreesAlgorithm):
+    """The GPU arm with CatBoost-style physical row compaction turned on.
+
+    A separate arm rather than a flag on the existing one, because the whole
+    point is to interleave the two inside one process: this repository has
+    measured the same benchmark drifting two- to threefold between time
+    windows, so an on-run against an off-run from an hour earlier compares
+    nothing.
+
+    `MOJOTREES_GPU_ROW_COMPACTION` is read once per `GpuActiveRows`, which is
+    constructed per fit, so setting it around the fit is enough and the arm
+    that runs next does not inherit it. It is restored rather than deleted
+    outright in case the caller set it deliberately.
+    """
+
+    device = "gpu"
+
+    def fit(self, data, args):
+        previous = os.environ.get("MOJOTREES_GPU_ROW_COMPACTION")
+        os.environ["MOJOTREES_GPU_ROW_COMPACTION"] = "1"
+        try:
+            return super().fit(data, args)
+        finally:
+            if previous is None:
+                del os.environ["MOJOTREES_GPU_ROW_COMPACTION"]
+            else:
+                os.environ["MOJOTREES_GPU_ROW_COMPACTION"] = previous
 
 
 class LgbmCPUDeterministicAlgorithm(Algorithm):
