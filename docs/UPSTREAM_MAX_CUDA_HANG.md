@@ -35,8 +35,22 @@ test_gpu_training       NEVER RETURNS NEVER RETURNS 14/14 pass, 63 s
 The 4090 was run specifically to test whether the hang was a Blackwell quirk
 or one bad host. It is neither: two NVIDIA architectures two generations
 apart, two CUDA versions, two datacenters, two host CPUs, same hang, same
-parked signature of zero CPU and zero GPU utilization. Meanwhile the AMD
-column is the same commit and the same MAX build finishing in a minute.
+parked signature of zero CPU and zero GPU utilization.
+
+**On "same commit", stated precisely.** The three arms did not run one
+identical revision, and an earlier draft of this report said they did. The
+RTX 5090 record is from 2026-08-18 at `542962c`; the MI300X and the RTX 4090
+ran on 2026-08-19 within minutes of each other at `1b57950` and `98f4905`.
+Between those two, the only file under `src/` that changed is
+`gpu_split_policy.mojo`, and the change is a string literal inside
+`split_device_note`, a reporting function no training path calls. Everything
+else in the range is documentation, bench notes, and a Python file. The arms
+are therefore functionally identical for this comparison, which is a checkable
+claim rather than the looser one we made first.
+
+One gap we cannot close: the MI300X's own log line naming its commit was not
+captured before the pod was destroyed, so `1b57950` is inferred from push
+timing rather than read from the run. The next run should print and keep it.
 
 That changes what this report is. Before it, everything pointing away from our
 own code was elimination: eleven hypotheses dead and no positive result. Now
