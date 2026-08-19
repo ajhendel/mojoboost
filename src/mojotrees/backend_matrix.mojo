@@ -48,9 +48,26 @@ pretend otherwise: see `matrix_is_reachable`.
 EVERY ROW IS TAGGED NUMERIC OR SCHEDULING, AND THAT TAG IS THE POINT
 --------------------------------------------------------------------
 A `DIVERGENCE_SCHEDULING` row changes launch geometry, tile shape, occupancy
-or buffer budget. It cannot change the answer, because every accumulation in
-this package is Int32 through integer atomics and integer addition is
-associative. Reorder the reduction all you like.
+or buffer budget.
+
+**The tag is conditional, and the condition must be stated rather than
+assumed.** A block count is a summation order. A partial-histogram
+replication factor decides how many partial sums combine and in what
+sequence. Those are scheduling decisions that would be *numeric* decisions
+under a floating-point accumulator, because float addition is neither
+associative nor exact.
+
+They are inert here for one reason: `gpu_portability` records that every
+accumulation in this package is Int32 through integer atomics, with no float
+atomic anywhere, and integer addition is associative and exact. Reorder that
+reduction all you like.
+
+So the honest statement of the rule is: **a row is NUMERIC if it changes the
+sequence or the precision of the arithmetic.** Geometry rows escape that only
+while the accumulator is integral. The day anyone adds a float atomic or a
+float partial-histogram flush, block count and replication factor become
+numeric rows and this classification is wrong until it is redone.
+`require_integer_accumulation` exists so that day fails loudly.
 
 A `DIVERGENCE_NUMERIC` row changes arithmetic. Float64, accumulator width,
 anything a backend may fuse or round differently.
@@ -431,6 +448,36 @@ def identity_mode_requested() -> Bool:
     flag reaches it.
     """
     return getenv(IDENTITY_ENV) == "1"
+
+
+def require_integer_accumulation(uses_float_atomics: Bool) raises:
+    """Fail loudly if the invariant the SCHEDULING tag rests on is broken.
+
+    Every `DIVERGENCE_SCHEDULING` row in this module is safe to vary per
+    vendor, under identity mode included, on the strength of one fact: every
+    accumulation in this package is Int32 through integer atomics, so a
+    different block count or replication factor reorders an exact associative
+    sum and cannot move a bit.
+
+    Introduce a float atomic and that stops being true. Block count becomes a
+    summation order, replication factor becomes a rounding sequence, and rows
+    tagged scheduling here quietly become numeric rows that identity mode is
+    no longer pinning. Nothing would fail; the models would simply stop
+    matching, which is the worst way to find out.
+
+    So the invariant is a call rather than a comment. A caller that adds a
+    float accumulation path passes True here and gets a clear error pointing
+    at the reclassification it now owes.
+    """
+    if uses_float_atomics:
+        raise Error(
+            "backend_matrix classifies grid shape, block count and"
+            " replication factor as DIVERGENCE_SCHEDULING, which is only"
+            " sound while every accumulation is Int32 through integer"
+            " atomics. A float accumulation path makes each of those a"
+            " summation order, so they are numeric rows now and identity"
+            " mode is not pinning them. Reclassify before shipping this",
+        )
 
 
 def matrix_is_reachable(api: Int) -> Bool:
