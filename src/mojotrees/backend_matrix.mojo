@@ -160,6 +160,7 @@ def divergence_name(kind: Int) raises -> String:
 # --- Column one: what the backend HAS -----------------------------------
 
 
+@fieldwise_init
 struct BackendCapability(Copyable, Movable):
     """What one API specifies, per row. No decisions live here.
 
@@ -342,6 +343,7 @@ def safe_capabilities() raises -> BackendCapability:
 # --- Column two: what this package USES ---------------------------------
 
 
+@fieldwise_init
 struct BackendPolicy(Copyable, Movable):
     """What this package chooses to do on one backend.
 
