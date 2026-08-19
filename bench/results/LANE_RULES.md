@@ -899,3 +899,62 @@ A lane that lands correct, tested, and moves nothing is a **null**, and a
 null reported clearly is worth more than a win reported loosely. This project
 removed 1,300 device copies per fit for 16 milliseconds and the honest report
 of that reordered the whole plan. Do not oversell.
+
+### 17. A DOCUMENT FALSIFIED BY YOUR OWN RESULT IS PART OF THE RESULT. FIX IT IN THE SAME COMMIT.
+
+Added 2026-08-19, after a single day produced four findings that each
+falsified text sitting in this repository, and the text outlived the findings
+by hours because "record the measurement" and "fix what the measurement
+refutes" were treated as two tasks and only the first had a home.
+
+**The trigger is DISCOVERY, not tidiness.** The moment a run, a source read,
+or a review shows that a docstring, a design note, a parity row, or a comment
+says something untrue, that document is broken and fixing it belongs to the
+commit that broke it. Not to a cleanup pass, not to a TODO, not to a note in
+a RESUME file that the next session may or may not open.
+
+**Why it has to be the same commit.** A stale claim is worse than a missing
+one, because a reader who finds it stops looking. This project has already
+paid for that twice: compact histogram addresses were built and measured
+TWICE because the first null lived in whichever note happened to be open, and
+a `crossover_rules()` docstring went on describing a multiclass rule for a
+day after the rule was withdrawn on evidence, while `device="auto"` quietly
+returned the slower of the two arms we ship.
+
+**What counts as fixing it.** Delete the false sentence and write the true
+one. Do NOT annotate the false sentence with a date and a correction and
+leave both standing: a cell that says "this used to say X, and X was wrong"
+costs the reader the same time as the error did. Rule 5a already says a flip
+is a sweep of the file rather than an annotation on the line; this is the
+same rule for prose.
+
+**The three places a finding leaks into and the sweep must cover:** the
+docstring of the function you measured, the design note or parity row that
+cites it, and the ledger (`CLOSED_LANES.md`) if the finding opens or closes a
+lane. A lane REOPENS when its measurement is shown to have been taken in the
+wrong configuration, and that is a ledger edit, not a footnote.
+
+**And the honest corollary.** If you discover a falsified document and do not
+have time to fix it properly, say so in the commit message by name and file.
+An unfixed known-false document that nobody has named is indistinguishable
+from one nobody has found.
+
+**AND IT BINDS SUBAGENTS HARDEST, which is where it was actually learned.**
+Every lane that reads competitor source or audits our own finds falsified
+text as a side effect, and a subagent is the worst possible place for that
+finding to die: it ends when the report ends. On 2026-08-19 three agents ran
+and all three found stale claims; only one of them had been asked to look.
+
+So a lane's report MUST carry a section listing every document it found
+false, by file and line, with the true statement, whether or not documents
+were its subject. That section is a deliverable, not a courtesy, and a lane
+that says "found in passing, left alone" without naming the file has not
+delivered it.
+
+A subagent that may not edit the repository (the usual case, since one
+process owns the checkout while a measurement is pending, rule 16) discharges
+this by writing exact replacement text the orchestrator can apply without
+re-deriving the finding. **The orchestrator then applies it in the commit
+that lands the lane, and does not carry it forward as a note.** A correction
+that reaches a RESUME file instead of the document is the failure this rule
+exists to stop.
