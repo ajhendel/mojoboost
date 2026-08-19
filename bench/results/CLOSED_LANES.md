@@ -55,3 +55,44 @@ LightGBM 8.96 s, XGBoost 12.15 s, CatBoost 17.99 s, **us CPU 25.40 s, us GPU
 42.2 s** (the GPU number re-measured 2026-08-19; the box drifts, ratios inside
 one run are what compare). Accuracy is tied with LightGBM, 0.88318 against
 0.88490.
+
+## Open, measured, and NOT closed: exclusive feature bundling
+
+Recorded here because it is the counterexample the rest of this file needs.
+Every closed lane above was a memory-layout hypothesis. This one is a
+difference in HOW MUCH WORK GETS DONE, and it is the only performance change
+measured this week that went the right way.
+
+LightGBM defaults `enable_bundle` **on**; we default it **off**. Covtype is
+**44 binary columns of 54**, the exact shape bundling exists for.
+
+| shape | result | accuracy |
+|---|---|---|
+| covtype, 581,012 x 54, 44 binary, leaf-wise CPU | **1.10x FASTER** (1.104 / 1.110 / 1.150 within-repeat, four windows) | **bit-identical** |
+| year, 463,715 x 90, all continuous | **0.955x, 4.5 percent slower** (0.893 / 0.983 / 0.964) | **bit-identical** |
+
+**Bit-identical in both directions**, because we accept only LightGBM's
+default `max_conflict_rate = 0.0`, which makes bundling exactly lossless.
+
+**Reach is proven, not assumed.** A third arm sets `min_reduction = 0.999`,
+which builds the bundle plan and then declines to apply it. It measured
+0.926 / 0.854 / 0.822 against the off arm, slower in every window: the win
+tracks the plan being APPLIED, and building one you do not use costs 15
+percent. That is also why the dense arm regresses.
+
+**What is not yet resolved:** whether the dense regression is a fixed
+plan-construction cost that amortizes away at realistic tree counts, or a
+per-tree cost. The two imply different defaults and the measurement is cheap.
+
+**Why the default cannot simply flip:** `efb.check_bundling_supported`
+RAISES whenever the run is not CPU, so `enable_bundle = True` as an
+unconditional default would start failing every `device="gpu"` fit. The
+correct shape is a tri-state where an unset value resolves to on-where-
+supported and an explicit `True` still raises loudly, so a caller who asked
+for bundling never silently does not get it.
+
+**And the structural note worth more than the switch:** LightGBM bundles at
+Dataset construction regardless of device, so their GPU arm gets bundling and
+ours structurally cannot. On covtype that is 54 columns against roughly 15,
+on the arm that is our slowest at 42.2 s. Making the GPU histogram
+bundle-aware is a project, not a switch, and it is not started.
