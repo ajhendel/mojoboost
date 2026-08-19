@@ -8,29 +8,41 @@ Written: 2026-08-14. Section 6 added 2026-08-15. Priority restated
 **Portability is the commitment. One source is the means.** Those are not the
 same promise, and until 2026-08-19 this document ran them together.
 
-Running well on Apple Silicon, NVIDIA and AMD is the product. A change that
-wins speed on one vendor by abandoning another is refused whatever the number
-says.
+The commitment is exactly this: **Apple Silicon, NVIDIA and AMD all work.**
+That is the product, and it is the thing users are expected to care about
+most. Nothing more is being promised, and in particular the commitment says
+nothing about how many code paths deliver it.
 
-Single-source compilation is how that is delivered today, and it is a means
-rather than a principle. A hand-written per-backend path is permitted when it
-is measured and priced. Two things should be weighed honestly before taking
-one, because the appeal of a specialized kernel is always obvious and its
-costs are not:
+**Multiple paths are fine. Vendor-specific kernels are fine. Toggles are
+fine.** Make each backend as fast as that backend can go. If NVIDIA wants
+Float64 and Metal cannot have it, NVIDIA gets Float64. If Metal wants an
+indirect command buffer nothing else has, Metal gets it. Single-source
+compilation is how this is delivered today and it is a convenience, not a
+rule; where it costs speed, it goes.
 
-- **Maintenance.** One source is the only affordable way a very small team
-  ships CUDA, Metal and HIP at once. Every forked path is a permanent
-  obligation on every future change, not a one-time cost.
-- **Cross-device identity becomes unreachable.** This is not hypothetical.
-  XGBoost has the fixed-point mechanism that makes summation order
-  independent and ships it by default in its GPU tree builder; its CPU
-  histogram accumulates in double-precision float. Two separately written
-  backends drifted into two different number systems, and no ordering
-  discipline on either side can close that. If bit-identity across devices
-  matters to a decision, a fork forecloses it.
+The only thing that is actually refused is **dropping a vendor**. Making one
+backend faster is always allowed. Leaving one backend broken, unbuilt, or
+untested to get there is not, because then the product is no longer the
+product.
 
-`gpu_portability.require_specializations_allowed` is the right shape for
-this: specialize behind a measurement, never behind a hunch.
+Two consequences to know about rather than to obey. Neither blocks anything:
+
+- **Forked paths cost maintenance forever.** One source is why a very small
+  team can ship three backends at all, so a fork is a standing obligation on
+  every later change rather than a one-time cost. Worth knowing, not worth
+  refusing over.
+- **Forks foreclose cross-device bit-identity.** XGBoost ships the
+  fixed-point mechanism that makes summation order-independent in its GPU
+  tree builder by default, while its CPU histogram accumulates in
+  double-precision float. Two separately written backends drifted into two
+  different number systems, and no ordering discipline closes that
+  afterwards. This matters only if bit-identity is something the project
+  wants, and under this priority it is subordinate to speed and portability.
+
+`gpu_portability.require_specializations_allowed` already exists and gates
+specialization on an unvalidated backend. That gate is about not shipping a
+kernel variant tuned for hardware nobody has run, which is a correctness
+concern. It is not a speed-approval process and must not become one.
 
 ## What this document covers
 
@@ -167,8 +179,10 @@ This is Apple's floor imposed on every backend, and it is the right call for
 one source, but it is a real cost on CUDA and HIP, which have Float64.
 
 **Reopened 2026-08-19.** Under the restated priority above, a Float64 path on
-a backend that has it is no longer ruled out on principle. Two facts belong
-next to that decision before anyone spends effort on it. Consumer NVIDIA parts
+a backend that has it is allowed. Apple's floor no longer binds NVIDIA or AMD
+by default, and `require_device_float64` is the one place to relax rather than
+a reason not to. One practical note, offered so the effort lands where it
+pays, not as an objection. Consumer NVIDIA parts
 run Float64 at roughly a sixty-fourth of their Float32 rate, and the only
 NVIDIA device this project has ever executed on is a consumer RTX 5090, so on
 that class of hardware Float64 is likely a large slowdown rather than a win;
