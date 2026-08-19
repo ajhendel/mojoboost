@@ -134,16 +134,22 @@ comptime SPLIT_POLICY_VERSION = 3
 #
 #   - the semantic refusal (`TreeParams.extra`, `feature_fraction_bylevel`),
 #   - the resident-frontier memory answer,
-#   - `_is_observed_m4`.
+#   - the validated-device table (`split_device_is_validated`).
 #
 # The third deserves a sentence, because it looks like the hardware scope of
-# a deleted threshold and is not. The sweep was run on one machine. Nothing
-# in this repository has ever run the device split search on CUDA or HIP
-# (`docs/GPU_VALIDATION.md`, whose rows for both read "not run"), so sending
+# a deleted threshold and is not. The sweep was run on one machine, so sending
 # unmeasured hardware to the device arm on the strength of an M4 measurement
 # would be installing a performance claim about a machine nobody owns -- the
-# exact move this module exists to refuse. It stays until somebody measures
-# a second device.
+# exact move this module exists to refuse. It stays until somebody measures a
+# second device.
+#
+# UPDATED 2026-08-19. When that was written, CUDA and HIP both read "not run"
+# in `docs/GPU_VALIDATION.md` and one sentence covered both. It no longer
+# does: an RTX 5090 ran this code on 2026-08-18 and passed 66 GPU assertions,
+# while AMD remains at zero. The gate's ANSWER is unchanged for both, because
+# correctness is not a crossover and neither has a sweep, but the two are no
+# longer in the same state and the reason a reader is given now says which is
+# which. That is what the validated-device table below exists for.
 #
 # SCOPE, because it is easy to overstate. This compares `SPLIT_POLICY_HOST`
 # against `SPLIT_POLICY_DEVICE_RESIDENT`, and both of them are GPU fits. It
@@ -186,20 +192,146 @@ def _is_metal(api: String) -> Bool:
     return api.find("metal") >= 0 or api.find("Metal") >= 0
 
 
-def _is_observed_m4(api: String, arch: String) -> Bool:
-    """Whether the report is the exact M4 profile measured above.
+# ---------------------------------------------------------------------------
+# THE VALIDATED-DEVICE TABLE
+#
+# WHY THIS IS A TABLE AND NOT A BOOLEAN. Until 2026-08-19 this was a single
+# predicate named `_is_observed_m4`, and its shape encoded an assumption that
+# had stopped being true: that there is one validated device, that it is an
+# M4, and that everything else is one undifferentiated "unknown". A second
+# device has now executed this code -- an NVIDIA RTX 5090 on 2026-08-18,
+# 66 GPU assertions passing across five suites -- and the predicate had no
+# way to say anything about it. It answered False and the fit took the host
+# scan, which is still the correct ROUTE and was the wrong SILENCE: a reader
+# could not tell "nobody has ever run this backend" from "this backend runs,
+# and the specific measurement that would promote it has not been taken".
+#
+# Those are different states and they have different next actions, so they
+# are now different rows.
+#
+# WHAT A ROW MEANS. A device is in the validated table when the
+# device-resident split search has been MEASURED against the host scan on it
+# and won. Nothing weaker qualifies. Correctness is not enough, and the
+# NVIDIA row below is exactly that case: the arithmetic is verified, the
+# crossover is not, so it stays out and its fits take the host scan.
+#
+# The gate is deliberately conservative in the same direction it always was.
+# Sending an unmeasured device to the device plane would install a
+# performance claim about a machine nobody here owns, and the host scan does
+# not produce the same model as the device scan on any backend -- the two
+# differ in precision and in when they dequantize -- so the wrong answer here
+# silently changes a model, not just a speed.
+#
+# HOW TO ADD A DEVICE. Two edits, both below, and one prerequisite:
+#
+#   0. Run the interleaved `gpu-host` against `gpu-device` sweep at several
+#      shapes on the new part, with disjoint ranges, and commit the record.
+#   1. Add a branch to `validated_split_device` returning a new row code.
+#   2. Add the matching branches to `split_device_name` and
+#      `split_device_evidence`. `split_device_evidence` must cite a committed
+#      file; "it seemed faster" is not a row.
+#
+# Nothing else in the module reads hardware. `decide_split_search` asks this
+# table one question and that is the whole hardware gate.
+# ---------------------------------------------------------------------------
 
-    Modular currently reports ``api=metal, arch_name=4-metal4`` on the
-    development M4.  Human-readable M4 spellings are accepted as well.  A
-    ten-core Metal device is *not* enough: another generation may share that
-    core count while having different synchronization and atomic costs.
+comptime SPLIT_DEVICE_UNVALIDATED = -1
+comptime SPLIT_DEVICE_APPLE_M4 = 0
+
+
+def validated_split_device(api: String, arch: String) -> Int:
+    """The validated-table row for this device, or `SPLIT_DEVICE_UNVALIDATED`.
+
+    Modular reports ``api=metal, arch_name=4-metal4`` on the development M4.
+    Human-readable M4 spellings are accepted as well.  A ten-core Metal device
+    is *not* enough on its own: another generation may share that core count
+    while having different synchronization and atomic costs, so the generation
+    has to be named.
     """
-    if not _is_metal(api):
-        return False
-    return (
+    if _is_metal(api) and (
         arch == "4-metal4"
         or arch.find("Apple M4") >= 0
         or arch.find("apple m4") >= 0
+    ):
+        return SPLIT_DEVICE_APPLE_M4
+    return SPLIT_DEVICE_UNVALIDATED
+
+
+def split_device_name(row: Int) -> String:
+    """The part a validated row stands for, spelled as the record spells it."""
+    if row == SPLIT_DEVICE_APPLE_M4:
+        return String("Apple M4, 10 core, Metal")
+    return String("unvalidated")
+
+
+def split_device_evidence(row: Int) -> String:
+    """The committed record that put a row in the table.
+
+    A row without a citable measurement is not a row.  This is the field that
+    makes that rule checkable by reading rather than by trusting.
+    """
+    if row == SPLIT_DEVICE_APPLE_M4:
+        return String(
+            "interleaved gpu-host against gpu-device sweep, 2026-08-16, four"
+            " shapes from 5.0M to 70.0M normalized work, five repeats each,"
+            " every range disjoint, device plane ahead 1.29x to 1.85x"
+        )
+    return String("none")
+
+
+def split_device_is_validated(api: String, arch: String) -> Bool:
+    """Whether the device-resident split search has been measured here."""
+    return validated_split_device(api, arch) != SPLIT_DEVICE_UNVALIDATED
+
+
+def split_device_note(api: String, arch: String) -> String:
+    """What is known about a device, including devices that are not in the
+    table.
+
+    `decide_split_search` returns `SPLIT_REASON_UNKNOWN_HARDWARE` for
+    everything outside the table, which is accurate and undifferentiated.
+    This is the string that differentiates it, for a warning, a trace line or
+    a benchmark header.  Three states exist and a reader needs to tell them
+    apart:
+
+      - validated: measured, and this fit takes the device plane;
+      - run but unmeasured: the backend executes and its crossover has not
+        been taken, so the fit takes the host scan and the missing work is a
+        benchmark;
+      - never run: no hardware of this kind has executed this code, so the
+        missing work is an entire validation pass.
+
+    NVIDIA moved from the third state to the second on 2026-08-18 and this
+    function exists because nothing could express that.
+    """
+    var row = validated_split_device(api, arch)
+    if row != SPLIT_DEVICE_UNVALIDATED:
+        return String("validated on ") + split_device_name(row) + String(
+            "; evidence: "
+        ) + split_device_evidence(row)
+    if _is_metal(api):
+        return String(
+            "Metal, but not the validated M4 generation. The device plane is"
+            " measured 1.29x to 1.85x ahead on the M4 and that number is an"
+            " M4 number; this part is unmeasured and takes the host scan"
+        )
+    if api.find("cuda") >= 0 or api.find("CUDA") >= 0:
+        return String(
+            "CUDA has executed this code: an RTX 5090 passed 66 GPU"
+            " assertions on 2026-08-18 (docs/GPU_VALIDATION.md). What is"
+            " missing is the interleaved host-against-device split sweep, not"
+            " a first run, and it is blocked behind the training hang"
+            " recorded in docs/UPSTREAM_MAX_CUDA_HANG.md. Until that sweep"
+            " exists this fit takes the host scan"
+        )
+    if api.find("hip") >= 0 or api.find("rocm") >= 0:
+        return String(
+            "no AMD device has ever executed this code (docs/AMD_GPU.md), so"
+            " nothing here is a claim about HIP. This fit takes the host scan"
+        )
+    return String(
+        "this backend is not in the validated table and has not been seen"
+        " here at all. This fit takes the host scan"
     )
 
 
@@ -339,7 +471,7 @@ def decide_split_search(
 
         HOST, `SPLIT_REASON_UNSUPPORTED`        if not semantics_supported
         HOST, `SPLIT_REASON_RESIDENT_MEMORY`    if not resident_frontier_fits
-        HOST, `SPLIT_REASON_UNKNOWN_HARDWARE`   if not observed M4
+        HOST, `SPLIT_REASON_UNKNOWN_HARDWARE`   if not in the validated table
         DEVICE_RESIDENT, `SPLIT_REASON_VALIDATED_WORKLOAD`   otherwise
 
     So every eligible shape on measured hardware takes the device search,
@@ -375,7 +507,7 @@ def decide_split_search(
             work,
             grow_policy=grow_policy,
         )
-    if not _is_observed_m4(api, arch):
+    if not split_device_is_validated(api, arch):
         return SplitSearchDecision(
             SPLIT_POLICY_HOST,
             SPLIT_REASON_UNKNOWN_HARDWARE,

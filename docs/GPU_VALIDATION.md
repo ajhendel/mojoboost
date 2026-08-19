@@ -28,11 +28,22 @@ FMA in `_range_add_raw_kernel` where Metal's compiler did not, breaking
 bit-identity between two score-update arms on 1841 of 3000 rows. Moving the
 multiply to the host closed it, and the test now passes on the same card.
 
-It is **not** `pass`, for two reasons. 36 GPU tests do not finish inside a
-300s cap and the reason is not yet established -- the two obvious
-explanations were tested and neither survived, see section 2b. And
-determinism has never been measured on this device at all, because the
-harness that would measure it is among the things that do not finish.
+It is **not** `pass`, and the reason narrowed considerably on 2026-08-18.
+**66 GPU assertions pass on this card**, across five suites, each in under
+thirty seconds, and they include the test that caught the FMA defect. What
+does not pass is one class of work: a full training fit never returns. That
+is a hang rather than slowness, it is localized to Modular's kernel-compiler
+runtime against the NVIDIA driver, and it is written up as an upstream report
+in [`docs/UPSTREAM_MAX_CUDA_HANG.md`](UPSTREAM_MAX_CUDA_HANG.md). Determinism
+has still never been measured here, because the harness that would measure it
+is the thing that hangs.
+
+An earlier revision of this section said "36 GPU tests do not finish inside a
+300s cap and the reason is not yet established". That count came from a run
+whose pool over-subscribed the GPU by two orders of magnitude and whose cap
+was set below the compile time, and it is superseded by the run recorded in
+section 2f. It is quoted rather than deleted because it was cited elsewhere
+while it stood.
 
 No row above may be read as a support claim. The full record, including the
 elimination argument that identifies the kernel, is in
@@ -538,6 +549,57 @@ Notes worth carrying into the CUDA and HIP runs:
   reserve-by-`MAX_BINS` gap is invisible at the default bin count. It only
   opens up at smaller `max_bin`, which is where to look for it.
 
+### Apple M4, Metal, 2026-08-19: the kernel-variety control
+
+Run on the development M4 as the CONTROL for the NVIDIA hang, not as a
+performance record. `pixi run probe-cuda-variety` compiles and launches 128
+distinct kernel instantiations in one process, importing nothing from this
+package. Two consecutive runs, same binary, same machine.
+
+```text
+device: Apple M4        api: metal      n_kernels: 128
+
+run 1, cold                          run 2, warm
+  KERNEL   0   8.541 ms                KERNEL   0   8.541 ms
+  KERNEL  76   8.550 ms                KERNEL   4   0.617 ms
+  KERNEL 127   9.955 ms                KERNEL  64   0.347 ms
+                                       KERNEL 127   0.378 ms
+  PHASE_G total  1370.67 ms            PHASE_G total    74.39 ms
+  ROUND 1..4  6.0 4.4 4.1 4.2 ms       ROUND 1..4  53.6 6.7 5.2 14.9 ms
+  VARIETY_COMPLETED_NO_DEADLOCK        VARIETY_COMPLETED_NO_DEADLOCK
+```
+
+**Three things, and the third was not what the probe was written to ask.**
+
+1. **The M4 does not hang.** 128 distinct kernels compile and launch in one
+   process and the program completes. The premise that the RTX 5090 hang is
+   specific to that backend survives its control, which it might not have.
+
+2. **Per-kernel cost is flat.** Cold, every kernel from 0 to 127 costs
+   roughly 8 to 13 ms with no trend. That kills a specific reading of the
+   NVIDIA hang -- that per-kernel JIT cost accumulates in-process and the
+   hang is simply the far end of a curve that never turns over. On Metal
+   there is no curve. Whatever NVIDIA is doing, it is not this.
+
+3. **Metal caches compiled kernels on disk, across processes.** The same
+   binary on the same machine took 1370 ms and then 74 ms, an 18x drop, with
+   the first kernel unchanged at 8.5 ms and every subsequent one falling to
+   under 1.4 ms. Nothing in the program changed between the runs, so the
+   amortization is outside it.
+
+The third one is the one to carry to NVIDIA, because
+`~/.nv/ComputeCache` holds **zero files** after a CUDA run. If that is
+accurate, then Metal amortizes kernel compilation across processes and CUDA
+recompiles everything from scratch every time, which is exactly the axis
+along which the working backend and the hanging backend differ. It is a
+hypothesis and not a result: the cheap test is to run this probe twice on the
+card and see whether run 2 is 18x faster or identical to run 1.
+
+**What this does NOT show.** Nothing about speed. These are microseconds of
+trivial arithmetic wrapped around a compile, and no number here belongs
+beside any training timing. The probe measures compilation and dispatch and
+was written to answer a yes-or-no question about hanging.
+
 ### NVIDIA RTX 5090, CUDA, 2026-08-18
 
 The first non-Metal execution in this project's history. Recorded from a
@@ -695,6 +757,14 @@ here, and applying one is not this document's call.
 
 #### 2b. The open question: 36 tests do not finish
 
+> **SUPERSEDED 2026-08-19 by section 2f. Kept for the method, not the
+> counts.** This section's numbers came from a suite run whose pool
+> over-subscribed the GPU and whose per-test cap sat below the compile time,
+> so its `TIMEOUT` rows conflate three different things. A later run with
+> both faults fixed put 66 assertions in the pass column and left exactly one
+> class of test hanging. Read 2f for the counts and this section for how the
+> two obvious explanations were killed.
+
 With a working per-test timeout, the GPU suite at `MOJOTREES_TEST_JOBS=12`
 reported:
 
@@ -715,7 +785,14 @@ that would plausibly wedge a barrier-synchronised pool. It does not explain
 this: pinning `MOJOTREES_NUM_WORKERS=8` changed nothing, both arms timed out
 identically.
 
-*Unresolved: slow CUDA codegen rather than a hang.* Both arms above were
+*Rejected, 2026-08-18: slow CUDA codegen rather than a hang.* The reasoning
+below was sound when written and the experiment that settled it is in section
+2d: `mojo build` compiles a hanging test in 31 seconds and the resulting
+binary, with no compiler anywhere in the process, hangs. It is not
+compilation. The original text follows because the reasoning was reasonable
+and the shape of the mistake is worth keeping.
+
+Both arms above were
 still emitting **compiler diagnostics** when the cap fired, not runtime
 output. `test_gpu_auto_reaches_gpu` spends 56s wall for 867ms of test time,
 so ~55s is compilation, and a heavier GPU test plausibly needs more than
@@ -760,7 +837,7 @@ PHASE_D_OK  PHASE_E_OK  PHASE_F_OK  REPRO2_COMPLETED_NO_DEADLOCK
 So the runtime primitives are sound on this device and the deadlock requires
 something this repository does that they do not cover. It is ours.
 
-#### 2d. The trigger is Modular's kernel JIT, and it is not kernel count
+#### 2d. The trigger is Modular's kernel JIT, and it is not histogram kernel count
 
 **Located, 2026-08-18.** `mojo build` compiles a hanging test in **31 seconds**
 and the resulting **binary** then hangs, so this is not the Mojo compiler and
@@ -777,7 +854,11 @@ process, names the component:
 holds **zero files** after a run, so nothing is cached and every process
 recompiles from scratch.
 
-**Kernel count is NOT the trigger.** `MOJOTREES_KERNEL_MATRIX_FULL = False`
+**Histogram kernel count is not the trigger.** *(This paragraph read "Kernel
+count is NOT the trigger" until 2026-08-19. The experiment is unchanged and
+the conclusion drawn from it was too broad: one family was reduced, not the
+process's whole kernel population. See section 2g, candidate 2.)*
+`MOJOTREES_KERNEL_MATRIX_FULL = False`
 collapses the two histogram families from 40 instantiations to 12. Rebuilt at
 that setting, `test_gpu_training` and `test_device` both still hang at a 600s
 cap (rc=124, 600s and 601s). The matrix reduction was built precisely so this
@@ -801,24 +882,71 @@ against the CUDA driver, and this repository cannot reach inside either.
 
 The next action is a bug report, not another experiment here. It has what one
 needs: a compiled binary that reproduces, a stack naming the component, exact
-versions (Mojo 1.0.0, driver 580.159.03, RTX 5090 sm_120), four probes proving
-the primitives are individually sound, and a falsified volume hypothesis.
+versions (Mojo 1.0.0, driver 580.159.03, RTX 5090 sm_120), and four probes
+proving the primitives are individually sound.
 
-#### 2d. Candidates that remain, in the order worth testing
+**That report is written**, at
+[`docs/UPSTREAM_MAX_CUDA_HANG.md`](UPSTREAM_MAX_CUDA_HANG.md), and it has not
+been filed anywhere. It states its own confidence separately from its
+evidence, and it is honest about the two things this record does not have: no
+minimal reproducer, and two untested candidates on our own side.
 
-1. **`create_sub_buffer`.** `GpuSplitSearcher.records_dev` owns `rec_i_dev`
-   and `rec_f_dev` as windows onto one allocation. It sits on the exact path
-   that hangs and is the one operation neither probe exercises. Adding it is a
-   ten-line edit to `probes/cuda_deadlock_launch.mojo`.
-2. **The 48 KiB shared-memory path.** This device reports
+#### 2f. The definitive run: what works and what blocks
+
+**2026-08-18, commit 542962c, RTX 5090.** Every earlier count in this record
+came from a suite run with one or both of two harness faults in it: a pool
+that over-subscribed the GPU by two orders of magnitude, and a per-test cap
+set below the NVPTX compile time. Both were fixed. This run has neither, uses
+a 240 s cap per test, and runs the suites one at a time.
+
+```text
+--- WHAT WORKS: known-good tests, 240s cap each ---
+test_gpu_scan_primitives     rc=0 secs=8   6 tests run: 6 passed
+test_gpu_partition_launches  rc=0 secs=10  8 tests run: 8 passed
+test_gpu_runtime             rc=0 secs=28  40 tests run: 40 passed
+test_gpu_raw_update_packing  rc=0 secs=10  2 tests run: 2 passed
+test_gpu_tiling              rc=0 secs=4   10 tests run: 10 passed
+--- WHAT BLOCKS ---
+test_gpu_training            rc=124 secs=241
+```
+
+**66 assertions pass on NVIDIA hardware.** That is the number to quote, and
+it is not a formality: `test_gpu_raw_update_packing` is the test that caught
+the FMA contraction defect the same morning, so the set has teeth.
+
+One class of test wedges. It is the class that drives a full training fit,
+which is also the class that pushes the most distinct kernel instantiations
+through Modular's JIT in a single process.
+
+#### 2g. The two candidates that remain, and both are cheap
+
+Every candidate the earlier revision of this section listed has since been
+probed and cleared. `create_sub_buffer` is covered by
+`probes/cuda_deadlock_subbuffer.mojo`; device access from inside
+`sync_parallelize` is covered by `probes/cuda_deadlock_parallel.mojo`, which
+shares one `DeviceContext` across eight workers doing allocation, launch and
+windowed writes. Both pass. Two candidates survive and neither has been run.
+
+1. **The 48 KiB shared-memory path.** This device reports
    `max_shared_memory_per_block = 49152` against the M4's 32768, so feature
    group 16 at 256 bins **raises on every Mac and is accepted here**. That is
    code no machine in this project's history has executed, and it targets the
-   histogram-arm tests specifically.
-3. **Device access from parallel workers.** Fits reach the device from inside
-   `sync_parallelize`; both probes are single-threaded.
+   histogram arm the hanging tests drive. Against it: an over-large shared
+   memory request normally fails a launch rather than parking a thread on a
+   futex. It is still the cheapest thing left.
 
-Each is a small edit to an existing probe and each returns a yes or no.
+2. **Kernel variety, as opposed to kernel count in one family.** Section 2d
+   records that collapsing the histogram families from 40 instantiations to
+   12 changed nothing, and that was read at the time as killing the volume
+   hypothesis. It is narrower than that: one family was reduced, and a
+   process that JITs hundreds would not be expected to notice 28 fewer. With
+   `~/.nv/ComputeCache` empty after every run, every instantiation is being
+   compiled from scratch. A probe that JITs N distinct kernels in one process
+   and sweeps N would settle it, and no existing probe varies the kernel at
+   all.
+
+Each is a small addition to an existing probe and each returns a yes or a no
+in minutes on leased hardware.
 
 #### 3. Determinism
 
