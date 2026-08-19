@@ -220,21 +220,26 @@ run 2, warm    128 kernels      74 ms    steady-state 0.4-1.4 ms each
 ```
 
 Nothing in the program changed. The first kernel costs 8.5 ms in both runs
-and every later one collapses, so **Metal is amortizing kernel compilation
-across processes, on disk.**
+and every later one collapses, so **something is saving the compilation work
+between processes on macOS.**
+
+We are deliberately not naming the mechanism. Our first draft said MAX was
+caching to disk; our own earlier audit of the MAX documentation
+(`docs/STARTUP_LATENCY.md`) says the documented cache is per-`DeviceContext`,
+in-memory, in-process, and that no on-disk kernel cache is documented at all.
+So the likelier explanation is that macOS caches compiled Metal shaders below
+MAX entirely. If either reading is wrong, please correct it; we would rather
+be told than guess in public.
 
 On the RTX 5090, `~/.nv/ComputeCache` holds **zero files** after a full run.
-If that observation is right, then the backend that works amortizes
-compilation and the backend that hangs recompiles every kernel from scratch
-in every process. That is the sharpest difference we can see between them,
-and it would mean a fit that instantiates many kernels is paying a cost on
-CUDA that it never pays on Metal.
+If the amortization above is real and has no equivalent there, then the
+backend that works pays for kernel compilation once and the backend that
+hangs pays it in every process, and a fit that instantiates many kernels is
+carrying a cost on CUDA that it never carries on Metal.
 
-We are not claiming that is the cause. We are saying it is the one asymmetry
-visible from outside, it is consistent with where the stack points, and it is
-cheap to check: run the probe twice on an NVIDIA card. If run 2 is 18x faster
-there too, this is a dead end and we will say so. If run 2 is identical to
-run 1, the caching question above stops being a housekeeping detail.
+We are not claiming that is the cause of the hang. We are saying it is the
+one asymmetry visible from outside, it is consistent with where the stack
+points, and it is cheap to check.
 
 ## Reproduction
 
