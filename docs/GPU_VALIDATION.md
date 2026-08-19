@@ -16,7 +16,7 @@ of it that do not exist yet.
 |---|---|---|---|---|---|
 | Metal | Apple M4 (10 core) | pass | pass | partial | not run |
 | CUDA | NVIDIA RTX 5090 (Blackwell, sm_120) | **partial** | **not run** | **partial** | **not run** |
-| HIP | none available | **not run** | **not run** | **not run** | **not run** |
+| HIP | AMD Instinct MI300X (gfx942, SR-IOV) | **pass** | **partial** | **not run** | **not run** |
 
 NVIDIA hardware executed this code for the first time on 2026-08-18, on a
 leased RunPod RTX 5090. **It builds, it runs, and one real cross-vendor
@@ -49,13 +49,19 @@ No row above may be read as a support claim. The full record, including the
 elimination argument that identifies the kernel, is in
 [NVIDIA RTX 5090, CUDA, 2026-08-18](#nvidia-rtx-5090-cuda-2026-08-18).
 
-AMD is unchanged and the sentence below still holds for it in full.
+**AMD hardware executed this code for the first time on 2026-08-19**, on a
+leased MI300X, and it did something no other backend has managed this month:
+it ran a full training fit. 22 assertions pass, including the 14 in
+`test_gpu_training`, the suite that has never returned on CUDA. See
+[AMD Instinct MI300X, HIP, 2026-08-19](#amd-instinct-mi300x-hip-2026-08-19).
 
-No AMD hardware has executed this code. Not once, not on a laptop,
-not in CI. The development machine is an Apple M4, GitHub-hosted runners have
-no GPU, and no self-hosted runner is registered. Every CUDA and HIP row above
-stays **not run** until someone executes the procedure below and pastes real
-output into the record section.
+That result is why the CUDA row's open question is now much narrower. The same
+source, the same commit, the same MAX version and the same script complete on
+HIP in 63 seconds and hang forever on CUDA. Whatever the cause is, we do it
+identically on both.
+
+The sentence this section used to carry, that no AMD hardware had ever
+executed this code, is retired. It stood from 2026-08-14 to 2026-08-19.
 
 Nothing in this repository should be read as a claim about NVIDIA or AMD
 behavior or performance. The Metal "partial" for phase timings means the
@@ -548,6 +554,99 @@ Notes worth carrying into the CUDA and HIP runs:
 - At 255 bins the shared reservation is 3072 bytes against 3060 used, so the
   reserve-by-`MAX_BINS` gap is invisible at the default bin count. It only
   opens up at smaller `max_bin`, which is where to look for it.
+
+### AMD Instinct MI300X, HIP, 2026-08-19
+
+The first AMD execution in this project's history, and the first backend other
+than Metal to complete a training fit. Leased RunPod pod, script run as the
+container's main process, output read from the pod log.
+
+```text
+Host        RunPod secure cloud, EU-RO-1, Ubuntu 24.04.2, glibc 2.39
+CPU         AMD EPYC 9474F 48-core, NPROC reports 192
+GPU         AMD Instinct MI300X, gfx942, SKU MI3SRIOV (SR-IOV virtualized)
+ROCm        6.4.1-83
+Toolchain   Mojo 1.0.0 (ed45d567), pixi 0.77.0
+Commit      1b57950
+```
+
+#### The result
+
+```text
+build                          rc=0   27 s   mojopkg 7,225,057 bytes
+probe alloc/launch/subbuffer/parallel  all REPRO*_COMPLETED_NO_DEADLOCK
+variety, 128 distinct kernels  cold 40.10 ms      warm 40.82 ms
+test_gpu_scan_primitives       rc=0   10 s   6 tests run: 6 passed
+test_gpu_raw_update_packing    rc=0   12 s   2 tests run: 2 passed
+test_gpu_training              rc=0   63 s   14 tests run: 14 passed
+```
+
+**22 assertions, all passing, on hardware that had never run a line of this
+code.** `test_gpu_raw_update_packing` is the FMA test, so the host-prescale
+fix holds on a third backend. `test_gpu_training` is the suite that hangs
+forever on CUDA.
+
+#### Why the FIRST AMD attempt reported no accelerator, and what it teaches
+
+The first pod, on `rocm/dev-ubuntu-24.04:latest`, built the package cleanly in
+27 seconds and then every probe printed:
+
+```text
+no accelerator present; nothing to reproduce
+```
+
+`rocm-smi` and `rocminfo` both saw gfx942. `/dev/kfd` and
+`/dev/dri/renderD176` were both present. The difference was one number:
+
+```text
+/opt/rocm/lib/libamdhip64.so.7        <- ROCm 7, MAX reports no accelerator
+/opt/rocm/.info/version  6.4.1-83     <- ROCm 6.4.1, everything works
+```
+
+`pixi.toml` pins `max >=26.5,<27`, which targets ROCm 6. On a ROCm 7 image MAX
+finds no HIP runtime it recognizes and `has_accelerator()` is false at
+COMPTIME, so the entire GPU half of this package compiles out and the build
+still succeeds. **A green build on AMD is not evidence the GPU path exists.**
+The two builds produced byte-identical package sizes, which is the cheapest
+tell that nothing GPU-shaped changed.
+
+Anyone validating on AMD should check `/opt/rocm/.info/version` before
+trusting a single result, and `docs/AMD_GPU.md` now says so.
+
+#### The variety numbers, beside the other two backends
+
+```text
+128 distinct kernels, one process     cold        warm      ratio
+  Metal, Apple M4                    1370 ms      74 ms     18.0x
+  HIP, AMD Instinct MI300X             40.1 ms    40.8 ms    1.0x
+```
+
+This reframes the cache question recorded in the M4 control. The M4's 18x
+cold-to-warm gap looked like the important variable; against HIP it is a
+symptom. Per kernel, cold, Metal costs 8 to 13 ms and HIP costs 0.30 ms, a
+gap of roughly thirty times. **The MI300X compiles 128 distinct kernels in
+less time than the M4 takes to compile four**, and needs no cross-process
+cache because there is nothing worth amortizing.
+
+So the honest statement is that per-kernel JIT cost differs enormously between
+backends and caching is how the expensive one copes. Whether CUDA is expensive
+like Metal or cheap like HIP is the number still missing.
+
+#### What this does NOT establish
+
+- **Determinism is `partial`, not `pass`.**
+  `test_gpu_subsampled_training_is_deterministic` passed, which is
+  within-run agreement. Repeat-run bit-identity across separate processes,
+  which is what the Metal row means by `pass`, was not attempted.
+- **No timing claim.** No phase sweep, no profiler, and nothing here may be
+  placed beside an M4 or a LightGBM number. The 63 seconds is a test suite
+  including compilation, not a fit time.
+- **One card, virtualized.** The SKU reads `MI3SRIOV`, so this is an SR-IOV
+  partition rather than a bare-metal MI300X, and CDNA results do not transfer
+  to RDNA parts in any case (`docs/AMD_GPU.md`).
+- **Nothing about MI300X performance.** The device plane stays gated on the
+  validated table in `gpu_split_policy`, because correctness is not a
+  crossover and no host-against-device sweep was run here.
 
 ### Apple M4, Metal, 2026-08-19: the kernel-variety control
 

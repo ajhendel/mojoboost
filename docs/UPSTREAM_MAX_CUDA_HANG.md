@@ -14,6 +14,40 @@ evidence took a day and about eleven dollars of leased hardware to assemble
 and should not live only in a web form. And the next person here who sees a
 GPU fit stop returning needs to find this before they spend the day again.
 
+## The strongest evidence arrived after this was drafted
+
+**2026-08-19. An AMD Instinct MI300X ran the same source, the same commit, the
+same MAX version and the same script, and it completed the training fit that
+never returns on the RTX 5090.**
+
+```text
+                         NVIDIA RTX 5090        AMD Instinct MI300X
+same commit                   1b57950                 1b57950
+build                         pass                    pass, 27 s
+4 MAX-only probes             pass                    pass
+128 distinct kernels          pending                 40.1 ms cold
+test_gpu_scan_primitives      6/6 pass                6/6 pass
+test_gpu_raw_update_packing   2/2 pass                2/2 pass
+test_gpu_training             NEVER RETURNS           14/14 pass, 63 s
+```
+
+That changes what this report is. Before it, everything pointing away from our
+own code was elimination: eleven hypotheses dead and no positive result. Now
+there is a positive result. Whatever this repository does that might deadlock
+a runtime, it does identically on HIP, on the same MAX build, and HIP finishes
+in a minute.
+
+We still cannot rule out an interaction that exists only on the CUDA path. But
+"our code is wrong" now has to explain why the same code is right on two of
+three backends, and the remaining candidate we named ourselves, the 48 KiB
+shared-memory path, is accepted on the MI300X too.
+
+**One incidental finding worth passing on**, because it cost us a pod. On a
+ROCm 7 image MAX reports no accelerator and `has_accelerator()` is false at
+comptime, so the whole GPU half of a package compiles out and the build still
+exits 0. The same source on ROCm 6.4.1 works completely. A green build is not
+evidence the GPU path was compiled in, and nothing in the output said so.
+
 ## How confident this is
 
 Stated before the evidence rather than after it, because the difference
@@ -27,11 +61,11 @@ GPU is idle, and no CPU is being burned. Four MAX-only probes covering every
 primitive we use all pass.
 
 **Inferred, and could be wrong.** That the fault is upstream rather than
-ours. A deadlock inside a library you call can still be caused by how you
-call it, and eleven eliminated explanations is not a proof, it is eleven
-eliminated explanations. What is true is that everything testable on our side
-came back clean and the two remaining candidates on our side are named below
-as untested rather than dismissed.
+ours. A deadlock inside a library you call can still be caused by how you call
+it. This was the weakest part of the report when it was drafted; the AMD run
+above is what changed it, because the same calls on the same MAX version
+complete on another backend. It is still an inference, and an interaction
+specific to the CUDA lowering would explain everything here just as well.
 
 ## The one-paragraph version
 

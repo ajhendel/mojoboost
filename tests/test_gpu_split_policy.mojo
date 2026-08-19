@@ -201,18 +201,25 @@ def test_the_validated_table_holds_one_row_and_cites_it() raises:
 def test_the_three_unvalidated_states_read_differently() raises:
     """"Not validated" is one route and three different situations.
 
-    A backend that has never run, a backend that runs and has not been
-    measured, and a Metal part that is not the measured generation all take
-    the host scan. They are the same decision and they are not the same fact,
-    and the reason a reader is handed has to tell them apart or the next
-    session repeats the work that has already been done.
+    A backend that runs and has not been measured, a second such backend with
+    a different gotcha, and a Metal part that is not the measured generation
+    all take the host scan. They are the same decision and they are not the
+    same fact, and the reason a reader is handed has to tell them apart or the
+    next session repeats work that has already been paid for.
+
+    UPDATED 2026-08-19. When this was written the same morning, HIP was the
+    "never run" case and the test asserted on that wording. An MI300X ran the
+    code that afternoon and passed 22 assertions, so the never-run state no
+    longer has an occupant and HIP moved into the same category as CUDA with
+    a different caveat attached. The table absorbed that as a data change,
+    which is what it was built for.
     """
     var cuda = split_device_note("cuda", "sm_120")
     var hip = split_device_note("hip", "gfx1100")
     var m3 = split_device_note("metal", "3-metal3")
 
     assert_true(cuda.find("66 GPU") >= 0)
-    assert_true(hip.find("has ever executed") >= 0)
+    assert_true(hip.find("22 assertions") >= 0)
     assert_true(m3.find("not the validated M4") >= 0)
 
     # The point of the function: no two of them say the same thing.
