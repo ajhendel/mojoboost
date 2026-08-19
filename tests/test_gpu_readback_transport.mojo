@@ -71,6 +71,7 @@ from std.sys import has_accelerator
 from std.testing import assert_equal, assert_false, assert_true, TestSuite
 from max.gpu.host import DeviceContext
 
+from mojotrees.apple_gpu_policy import API_METAL, parse_api
 from mojotrees.gpu_runtime import (
     N_READBACK_TRANSPORTS,
     READBACK_DEFAULT,
@@ -81,6 +82,7 @@ from mojotrees.gpu_runtime import (
     READBACK_PINNED_PAIR_SYNC,
     READBACK_PLAIN_ONE,
     READBACK_PLAIN_PAIR,
+    readback_correct_on,
     readback_report,
     readback_transport,
     readback_transport_name,
@@ -102,14 +104,29 @@ something to be wrong about, and odd so that a transport that reversed the
 slot order would not be hidden by a symmetric count."""
 
 
+def _api_is_metal() raises -> Bool:
+    """Whether the device this process opened is a Metal one.
+
+    Derived the same way `GpuSplitSearcher` derives it
+    (`gpu_split_search.mojo:7233`), from `parse_api(ctx.api())`, so the tests
+    and the guard cannot disagree about which backend they are on. Opening a
+    context to ask is cheap next to what these tests already do.
+    """
+    return parse_api(DeviceContext().api()) == API_METAL
+
+
 def _implemented_arms() -> List[Int]:
     """The four transports `download_words` executes, cheapest first.
 
-    All four are correct on Metal and all four must return the same words.
-    They are not redundant with each other: `plain_one` differs from
+    All four are correct ON METAL and, there, all four must return the same
+    words. They are not redundant with each other: `plain_one` differs from
     `pinned_pair_sync` in two ways at once (the destination kind and the
     packing), and the two middle arms hold one of those fixed while changing
     the other, so a window can attribute a difference to one of them.
+
+    This list is the CATALOG. Use `_runnable_arms` to walk them on a device:
+    two of these are refused off Metal and walking the catalog there asserts
+    something false.
     """
     return [
         READBACK_PLAIN_ONE,
@@ -117,6 +134,35 @@ def _implemented_arms() -> List[Int]:
         READBACK_PLAIN_PAIR,
         READBACK_PINNED_PAIR_SYNC,
     ]
+
+
+def _runnable_arms(api_is_metal: Bool) raises -> List[Int]:
+    """The implemented arms THIS backend is known to get right.
+
+    MEASURED 2026-08-19, on the first AMD hardware to run this file. Three
+    tests below walk the arms and assert they agree. They walked the catalog,
+    which on Metal is every arm and off Metal is two arms too many: the
+    unpinned rows rest on the copy draining inside itself, a fact established
+    by disassembling Metal's runtime and unestablished anywhere else, so
+    `require_readback_correct` refuses them. It refused, correctly, and the
+    suite recorded three failures on an MI300X.
+
+    The guard was right and the enumeration was wrong. Filtering here keeps
+    the cross-arm agreement property intact where it means something, and
+    stops a correct refusal from reading as a defect.
+
+    This is not a way to skip a failing arm. An arm drops out only when the
+    TABLE says this backend cannot be trusted with it, which is the same
+    column the guard fires on, so a row cannot quietly stop being tested
+    without someone editing the claim that excused it. On Metal the filter
+    removes nothing and every test below is exactly as strong as it was.
+    """
+    var out = List[Int]()
+    var catalog = _implemented_arms()
+    for i in range(len(catalog)):
+        if readback_correct_on(catalog[i], api_is_metal):
+            out.append(catalog[i])
+    return out^
 
 
 # --- Host-side: the table, the default, and the layout --------------------
@@ -292,7 +338,7 @@ def test_every_arm_unpacks_the_distinguishable_fixture() raises:
         var ctx = DeviceContext()
         var searcher = GpuSplitSearcher(ctx, 4, 8, max_records=_SLOTS)
         _write_fixture(ctx, searcher)
-        var arms = _implemented_arms()
+        var arms = _runnable_arms(_api_is_metal())
         for i in range(len(arms)):
             searcher.set_readback_transport(arms[i])
             var words_i = List[Int32]()
@@ -416,7 +462,7 @@ def test_every_arm_returns_the_same_record_from_a_real_search() raises:
         ctx.enqueue_copy(dst_buf=hist, src_ptr=words.unsafe_ptr())
         ctx.synchronize()
 
-        var arms = _implemented_arms()
+        var arms = _runnable_arms(_api_is_metal())
         searcher.set_readback_transport(arms[0])
         searcher.enqueue(hist, params, 1.0, 1.0)
         var reference = searcher.download(0)
@@ -460,7 +506,7 @@ def test_the_frontier_download_agrees_across_arms() raises:
         ctx.enqueue_copy(dst_buf=hist, src_ptr=words.unsafe_ptr())
         ctx.synchronize()
 
-        var arms = _implemented_arms()
+        var arms = _runnable_arms(_api_is_metal())
         var reference = List[GpuSplitRecord]()
         for i in range(len(arms)):
             searcher.set_readback_transport(arms[i])

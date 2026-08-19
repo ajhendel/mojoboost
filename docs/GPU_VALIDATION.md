@@ -15,7 +15,7 @@ of it that do not exist yet.
 | Backend | Device | Correctness | Determinism | Phase timings | Profiler trace |
 |---|---|---|---|---|---|
 | Metal | Apple M4 (10 core) | pass | pass | partial | not run |
-| CUDA | NVIDIA RTX 5090 (Blackwell, sm_120) | **partial** | **not run** | **partial** | **not run** |
+| CUDA | NVIDIA RTX 5090 (sm_120) and RTX 4090 (sm_89) | **partial** | **not run** | **partial** | **not run** |
 | HIP | AMD Instinct MI300X (gfx942, SR-IOV) | **pass** | **partial** | **not run** | **not run** |
 
 NVIDIA hardware executed this code for the first time on 2026-08-18, on a
@@ -634,6 +634,32 @@ like Metal or cheap like HIP is the number still missing.
 
 #### What this does NOT establish
 
+#### The full GPU suite, 2026-08-19
+
+The targeted run above was followed by the whole GPU suite, at
+`MOJOTREES_GPU_TEST_JOBS=4`. **53 test files, 50 passed.** All three failures
+were investigated and none is a library defect:
+
+| test | verdict |
+|---|---|
+| `test_gpu_objectives_native` | re-run alone: 16 tests, 16 passed. GPU contention |
+| `test_gpu_launch_fusion` | re-run alone: 7 tests, 7 passed. GPU contention |
+| `test_gpu_readback_transport` | `require_readback_correct` refusing the unpinned arms, correctly. The tests enumerated the catalog instead of what this backend can run. Fixed |
+
+The readback one is the valuable failure. The guard gained its non-Metal
+column on 2026-08-18, having had **zero readers in the codebase** before that,
+and this is the first time any machine exercised it. It refused `plain_one` on
+HIP with the message it was written to give. Three tests then walked every
+implemented arm and asserted agreement, which is true on Metal and false
+anywhere the table refuses an arm. `_runnable_arms` now filters the catalog
+through the same column the guard fires on.
+
+Two tests failing only under four concurrent jobs on one GPU is its own small
+finding: the pool cap of 4, set the same morning to replace a cap of
+`NCPU - 2`, is still too high for a single device.
+
+#### What this does NOT establish
+
 - **Determinism is `partial`, not `pass`.**
   `test_gpu_subsampled_training_is_deterministic` passed, which is
   within-run agreement. Repeat-run bit-identity across separate processes,
@@ -647,6 +673,77 @@ like Metal or cheap like HIP is the number still missing.
 - **Nothing about MI300X performance.** The device plane stays gated on the
   validated table in `gpu_split_policy`, because correctness is not a
   crossover and no host-against-device sweep was run here.
+
+### NVIDIA RTX 4090, CUDA, 2026-08-19: the hang is not one card
+
+Run to answer one question: is the CUDA hang a property of Blackwell, of one
+host, or of CUDA. It is CUDA.
+
+```text
+Host        RunPod secure cloud, EU-RO-1, Ubuntu 24.04.3
+GPU         NVIDIA GeForce RTX 4090 (Ada, sm_89)
+CUDA host   13.0
+Commit      98f4905
+```
+
+```text
+build                          rc=0   19.7 s
+variety, 128 distinct kernels  cold 2.450 ms      warm 2.417 ms
+probe alloc/launch/subbuffer/parallel   all REPRO*_COMPLETED_NO_DEADLOCK
+test_gpu_scan_primitives       rc=0   5 s    6 tests run: 6 passed
+test_gpu_raw_update_packing    rc=0   7 s    2 tests run: 2 passed
+test_gpu_training              rc=124        601 s, killed at the cap
+```
+
+Everything that passed on the 5090 passes here, and the one thing that hangs
+there hangs here. While it hung the pod reported `cpu.util 0`, `gpu.util 0`,
+which is the same parked signature as the 5090 rather than slowness.
+
+**What varies between the two NVIDIA records, and what does not:**
+
+| | RTX 5090, 2026-08-18 | RTX 4090, 2026-08-19 |
+|---|---|---|
+| Architecture | Blackwell, sm_120 | Ada, sm_89 |
+| CUDA host | 12.8 | 13.0 |
+| Datacenter | EU-CZ-1 | EU-RO-1 |
+| Host CPU | 256 vCPU x86-64 | Xeon-class, different |
+| `test_gpu_training` | never returns | rc=124 at 601 s |
+
+Two architectures two generations apart, two CUDA versions, two datacenters,
+two host CPUs. **The hang is not a Blackwell quirk, not one bad host, and not
+a driver version.** Every earlier CUDA finding rested on a single machine;
+this one does not.
+
+#### The cache hypothesis is dead, and CUDA killed it
+
+On 2026-08-19 morning this record proposed that the sharpest difference
+between the working backend and the hanging one was kernel-compilation
+caching: Metal amortizes across processes, `~/.nv/ComputeCache` is empty after
+a CUDA run, so perhaps CUDA pays a full compile in every process and that is
+where it wedges. It was labelled a hypothesis and the falsification named was
+"run the variety probe twice on the card."
+
+Run on the card, twice, with HIP for a third point:
+
+```text
+128 distinct kernels, one process    cold        warm      per kernel
+  Metal, Apple M4                   1370 ms      74 ms     8-13 ms
+  HIP, AMD Instinct MI300X            40.1 ms    40.8 ms   0.30 ms
+  CUDA, NVIDIA RTX 4090                2.45 ms    2.42 ms  0.017 ms
+```
+
+**CUDA is the FASTEST of the three by a wide margin**, 560x quicker than
+Metal cold, and shows no cold-to-warm gap because there is nothing worth
+amortizing at 17 microseconds a kernel. The empty `ComputeCache` is not a
+symptom of anything; it is what an absent cost looks like.
+
+So the hypothesis is withdrawn. What survives is the plain fact that
+per-kernel JIT cost differs by roughly seven hundred times across three
+backends, and that caching is how the slowest one copes. Nothing about the
+hang follows from it.
+
+This is recorded at length because the hypothesis was one decision away from
+being sent to Modular as a claim about their runtime.
 
 ### Apple M4, Metal, 2026-08-19: the kernel-variety control
 

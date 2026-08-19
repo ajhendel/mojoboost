@@ -21,15 +21,22 @@ same MAX version and the same script, and it completed the training fit that
 never returns on the RTX 5090.**
 
 ```text
-                         NVIDIA RTX 5090        AMD Instinct MI300X
-same commit                   1b57950                 1b57950
-build                         pass                    pass, 27 s
-4 MAX-only probes             pass                    pass
-128 distinct kernels          pending                 40.1 ms cold
-test_gpu_scan_primitives      6/6 pass                6/6 pass
-test_gpu_raw_update_packing   2/2 pass                2/2 pass
-test_gpu_training             NEVER RETURNS           14/14 pass, 63 s
+                        RTX 5090      RTX 4090      MI300X
+architecture            sm_120        sm_89         gfx942
+CUDA / ROCm host        12.8          13.0          6.4.1
+build                   pass          pass          pass
+4 MAX-only probes       pass          pass          pass
+128 distinct kernels    -             2.45 ms       40.1 ms
+scan primitives         6/6           6/6           6/6
+raw update packing      2/2           2/2           2/2
+test_gpu_training       NEVER RETURNS NEVER RETURNS 14/14 pass, 63 s
 ```
+
+The 4090 was run specifically to test whether the hang was a Blackwell quirk
+or one bad host. It is neither: two NVIDIA architectures two generations
+apart, two CUDA versions, two datacenters, two host CPUs, same hang, same
+parked signature of zero CPU and zero GPU utilization. Meanwhile the AMD
+column is the same commit and the same MAX build finishing in a minute.
 
 That changes what this report is. Before it, everything pointing away from our
 own code was elimination: eleven hypotheses dead and no positive result. Now
@@ -237,7 +244,31 @@ cheapest next experiment and it has not been run. It could equally be
 nothing: an over-large shared memory request would normally fail a launch
 rather than park a thread on a futex.
 
-## The one asymmetry we can see between the working backend and the hanging one
+## A hypothesis we withdrew before sending it to you
+
+An earlier draft of this report proposed that kernel-compilation caching was
+the axis: Metal amortizes compiled kernels across processes, `~/.nv/ComputeCache`
+is empty after a CUDA run, so perhaps CUDA recompiles everything in every
+process and wedges somewhere in that. We wrote down the falsification, ran it,
+and it failed:
+
+```text
+128 distinct kernels, one process   cold        warm      per kernel
+  Metal, Apple M4                  1370 ms      74 ms     8-13 ms
+  HIP, AMD Instinct MI300X           40.1 ms    40.8 ms   0.30 ms
+  CUDA, NVIDIA RTX 4090               2.45 ms    2.42 ms  0.017 ms
+```
+
+CUDA is the fastest of the three by a wide margin and shows no cold-to-warm
+gap, because there is nothing worth caching at 17 microseconds a kernel. The
+empty `ComputeCache` is what an absent cost looks like, not a symptom.
+
+The hypothesis is withdrawn. It is left in this report because it was one
+decision away from being sent to you as a claim about your runtime, and
+because the numbers above may be independently useful: per-kernel JIT cost
+spans roughly seven hundred times across the three backends you support.
+
+## The asymmetry we thought we saw between the working backend and the hanging one
 
 Added 2026-08-19, from the Metal control run.
 
@@ -315,9 +346,10 @@ gdb -q -ex 'set follow-fork-mode child' -ex run \
 1. Whether a hang inside `libKGENCompilerRTShared` against `libcuda` on
    sm_120 is known, and whether there is a workaround or a version that does
    not have it.
-2. Whether MAX's kernel JIT is expected to write to `~/.nv/ComputeCache`, and
-   whether an empty cache after a full run indicates a misconfiguration on
-   our side. **This is now our leading question, see below.**
+2. ~~Whether MAX's kernel JIT is expected to write to `~/.nv/ComputeCache`.~~
+   **Withdrawn.** We measured it and CUDA compiles kernels faster than either
+   other backend, so the empty cache is not a symptom. Struck rather than
+   deleted because we would rather show the question we retracted.
 3. Whether a single process compiling many distinct kernel instantiations at
    run time is a supported shape, or whether we should be pre-compiling.
 

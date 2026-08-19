@@ -907,6 +907,29 @@ def env_readback_transport_for(api_is_metal: Bool) raises -> Int:
     return env_readback_transport()
 
 
+def readback_correct_on(transport: Int, api_is_metal: Bool) raises -> Bool:
+    """Whether this backend is known to get this transport right.
+
+    The predicate behind `require_readback_correct`, split out so a caller can
+    ASK instead of catching. The guard raises with a long, deliberately
+    instructive message; that message is right for a fit that picked an unsafe
+    arm and wrong for a test that means to enumerate the arms this backend can
+    actually run.
+
+    Added 2026-08-19, after the first AMD run. Three tests in
+    `test_gpu_readback_transport` walk every implemented arm and assert the
+    arms agree. On Metal all four are correct so the walk is total; on HIP the
+    two unpinned arms are refused, the guard raised exactly as designed, and
+    the tests recorded it as three failures. The refusal was right and the
+    enumeration was wrong. A test that wants "every arm this backend can run"
+    now has a way to say so.
+    """
+    var row = readback_transport(transport)
+    if api_is_metal:
+        return row.correct_on_metal
+    return row.correct_elsewhere
+
+
 def require_readback_correct(transport: Int, api_is_metal: Bool) raises:
     """Refuse a transport this backend is known to get wrong.
 

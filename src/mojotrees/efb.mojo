@@ -259,7 +259,7 @@ Differences from LightGBM
   implementation does not, for the reason above.
 """
 
-from .binning import BinMapper, BinnedMatrix
+from .binning import BinMapper, BinnedMatrix, _rebuild_row_major
 from .metrics import _argsort
 from .categorical import CategoricalSpec
 from .sparse import SparseBinnedMatrix
@@ -1596,6 +1596,27 @@ def prepare_bundling(
     if not plan.use_bundling:
         return BundledMatrix.none()
     var bundled = bundle_dense(data, plan)
+    # REBUILD THE ROW-MAJOR VIEW OVER THE BUNDLES, which is the whole point of
+    # doing it here rather than leaving it to whoever built `data`.
+    #
+    # `bundle_dense` returns a fresh `BinnedMatrix`, and both of that struct's
+    # constructors set `row_stride = 0`, so a bundled matrix arrived with NO
+    # row-major view and `resolve_bin_layout` silently degraded every node to
+    # feature-major. The view is built by `BinMapper.transform`, before
+    # bundling exists, so its record was one byte per RAW feature.
+    #
+    # That is not what LightGBM runs and it is why our row-major arm has never
+    # been measured in the configuration that matters. LightGBM bundles first
+    # and builds the multi-value bin over the BUNDLES (`dataset.cpp:366-372`
+    # then `:589-593` at 4.7.0), so on covtype its record is 12 bytes where
+    # ours was 54: the 44 binary columns there are two exact one-hot blocks,
+    # wilderness 1-of-4 and soil 1-of-40, which collapse to two bundles.
+    # LightGBM then picks row-wise for that shape, and says so on stdout:
+    # "Auto-choosing row-wise multi-threading" on this very dataset.
+    #
+    # Same decision procedure as everywhere else, so the environment policy
+    # and the budget keep one home.
+    _rebuild_row_major(bundled, True)
     return BundledMatrix(plan^, bundled^, True)
 
 

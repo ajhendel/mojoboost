@@ -15,7 +15,7 @@ the "predicted a win" column below was a confident model.
 | lane | result | evidence |
 |---|---|---|
 | Compact histogram addresses (footprint-by-address) | **1.006x, three interleaved runs.** Tried twice | the 22.3 ms / 38 percent prize rested on it and is withdrawn |
-| Row-major bin layout | **1.15-1.35x SLOWER**, built and measured | fixes line utilization, forces every feature's histogram slice resident |
+| Row-major bin layout | **REOPENED 2026-08-19, the 1.15-1.35x was measured in the wrong configuration** | see below |
 | 16-byte histogram cell | **run invalidated by its own pre-registered control** (multiclass moved 5.5 / 7.2 percent where the switch cannot fire) | not a null, an unmeasurable |
 | GPU row compaction, per split | **1.535x SLOWER, ranges disjoint** | `GPU_ROW_COMPACTION_2026-08-19.md`, covtype, 3 interleaved repeats |
 | CPU level-wise fold compaction, CatBoost cadence | **2.6x SLOWER, ranges disjoint** | covtype symmetric depth 8, 3 interleaved repeats, bit-identical |
@@ -115,3 +115,64 @@ Dataset construction regardless of device, so their GPU arm gets bundling and
 ours structurally cannot. On covtype that is 54 columns against roughly 15,
 on the arm that is our slowest at 42.2 s. Making the GPU histogram
 bundle-aware is a project, not a switch, and it is not started.
+
+
+## REOPENED: the row-major view, measured over bundles
+
+The 1.15-1.35x loss was real and it was measured at `row_stride = 54`, one
+byte per RAW feature. That is not the configuration LightGBM ships and it was
+not a fair test of the layout.
+
+LightGBM bundles FIRST and builds its multi-value bin over the BUNDLES
+(`dataset.cpp:366-372` then `:589-593` at 4.7.0), so on covtype its record is
+**12 bytes** where ours was 54: the 44 binary columns there are two exact
+one-hot blocks, wilderness 1-of-4 and soil 1-of-40, which collapse to two
+bundles. LightGBM then picks row-wise for that shape and says so on stdout,
+which we captured on this machine: `Auto-choosing row-wise multi-threading`,
+`Total Bins 2262`, 53 used features.
+
+Our two halves could not meet: `bundle_dense` returns a fresh `BinnedMatrix`
+and both of that struct's constructors set `row_stride = 0`, so every bundled
+matrix arrived with no row-major view and silently degraded to feature-major.
+The view was built by `BinMapper.transform`, before bundling exists.
+
+Rebuilding the view over the bundles, covtype, 30 trees, one window,
+bit-identical across every arm:
+
+Four arms, one window, three repeats, bit-identical across every arm,
+covtype 30 trees:
+
+| arm | median | min | max | vs default |
+|---|---|---|---|---|
+| shipped default | 7.929 s | 7.655 | 8.158 | |
+| bundle, auto layout | 6.817 s | 6.759 | 6.882 | **1.163x, disjoint** |
+| bundle, force row-major | 6.786 s | 6.680 | 6.894 | **1.168x, disjoint** |
+| bundle, force feature-major | 7.066 s | 6.924 | 7.094 | 1.122x, disjoint |
+
+**Bundling is worth 1.122x and the row-major layout adds 1.041x on top of it**
+(7.066 against 6.786, and those two ranges are disjoint by 30 ms, which is
+thin). `auto` already selects row-major, so the shipped path needs no switch.
+
+**An earlier three-arm run put the layout's share at 1.13x and that was
+wrong.** Its feature-major arm set `MOJOTREES_CPU_ROW_MAJOR=0`, which also
+disables the compact private accumulator, so it measured two changes and
+attributed both to one. The four-arm number above supersedes it.
+
+**Do not read this as the density diagnosis being revived.** See below.
+
+## The density model itself is now doubted, on its own falsification test
+
+The level-wide-buffer proposal rests on bin-matrix line traffic growing as
+`2^d` while the scatter count per level stays flat, which predicts the
+deepest level of a depth-8 symmetric tree costing roughly 20x the shallowest.
+
+Measured, covtype symmetric, marginal cost of each added level:
+**0.309, 0.309, 0.532, 0.510, 0.869, 0.903 s**. Growth across those five
+levels is **2.9x, against a predicted 20x**.
+
+The effect is real and much weaker than the model. Fifth time this week that
+arithmetic over a profile predicted a large effect and measurement returned a
+small one. **A level-wide accumulation buffer is not justified by this model**,
+whatever its elegance, and the agreement between the model's 3.9 GB/tree and
+our independently recorded 3.9 GB/tree turns out not to license the
+prediction that removing that traffic removes proportional time.
