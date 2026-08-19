@@ -203,6 +203,39 @@ cheapest next experiment and it has not been run. It could equally be
 nothing: an over-large shared memory request would normally fail a launch
 rather than park a thread on a futex.
 
+## The one asymmetry we can see between the working backend and the hanging one
+
+Added 2026-08-19, from the Metal control run.
+
+We ran the kernel-variety probe on the Apple M4, where this project's entire
+GPU suite passes, to check that 128 distinct kernels in one process is not
+simply too much to ask of anybody. It is not: the M4 completes it, and
+per-kernel cost is flat from kernel 0 to kernel 127 with no trend.
+
+But two consecutive runs of the same binary on the same machine gave this:
+
+```text
+run 1, cold    128 kernels    1370 ms    steady-state 8-13 ms each
+run 2, warm    128 kernels      74 ms    steady-state 0.4-1.4 ms each
+```
+
+Nothing in the program changed. The first kernel costs 8.5 ms in both runs
+and every later one collapses, so **Metal is amortizing kernel compilation
+across processes, on disk.**
+
+On the RTX 5090, `~/.nv/ComputeCache` holds **zero files** after a full run.
+If that observation is right, then the backend that works amortizes
+compilation and the backend that hangs recompiles every kernel from scratch
+in every process. That is the sharpest difference we can see between them,
+and it would mean a fit that instantiates many kernels is paying a cost on
+CUDA that it never pays on Metal.
+
+We are not claiming that is the cause. We are saying it is the one asymmetry
+visible from outside, it is consistent with where the stack points, and it is
+cheap to check: run the probe twice on an NVIDIA card. If run 2 is 18x faster
+there too, this is a dead end and we will say so. If run 2 is identical to
+run 1, the caching question above stops being a housekeeping detail.
+
 ## Reproduction
 
 ```bash
@@ -223,6 +256,14 @@ pixi run probe-cuda-subbuffer
 pixi run probe-cuda-parallel
 ```
 
+And the variety probe, which should be run **twice**, because the difference
+between the two runs is the measurement:
+
+```bash
+pixi run probe-cuda-variety      # cold
+pixi run probe-cuda-variety      # warm, and on Metal this is 18x faster
+```
+
 To see the stack rather than just the timeout, `gdb` must be the parent:
 
 ```bash
@@ -237,7 +278,7 @@ gdb -q -ex 'set follow-fork-mode child' -ex run \
    not have it.
 2. Whether MAX's kernel JIT is expected to write to `~/.nv/ComputeCache`, and
    whether an empty cache after a full run indicates a misconfiguration on
-   our side.
+   our side. **This is now our leading question, see below.**
 3. Whether a single process compiling many distinct kernel instantiations at
    run time is a supported shape, or whether we should be pre-compiling.
 
@@ -250,7 +291,7 @@ gdb -q -ex 'set follow-fork-mode child' -ex run \
 | Filed upstream | **not yet.** Needs a decision on where (Modular forum against GitHub issue) and Andrew's go |
 | Minimal reproducer | not attempted, see above |
 | Shared memory probe | not written, see above |
-| Kernel-variety probe | not written. A probe that JITs N distinct kernels in one process, swept over N, would settle the volume question the histogram reduction did not |
+| Kernel-variety probe | **written and run on the M4 control.** 128 distinct kernels complete, cost is flat, and the cold-to-warm gap exposed the cache asymmetry above. Not yet run on NVIDIA |
 
 Nothing here has been sent anywhere. Filing it is an outward action and this
 project does not take those without an explicit go.

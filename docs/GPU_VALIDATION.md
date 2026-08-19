@@ -549,6 +549,57 @@ Notes worth carrying into the CUDA and HIP runs:
   reserve-by-`MAX_BINS` gap is invisible at the default bin count. It only
   opens up at smaller `max_bin`, which is where to look for it.
 
+### Apple M4, Metal, 2026-08-19: the kernel-variety control
+
+Run on the development M4 as the CONTROL for the NVIDIA hang, not as a
+performance record. `pixi run probe-cuda-variety` compiles and launches 128
+distinct kernel instantiations in one process, importing nothing from this
+package. Two consecutive runs, same binary, same machine.
+
+```text
+device: Apple M4        api: metal      n_kernels: 128
+
+run 1, cold                          run 2, warm
+  KERNEL   0   8.541 ms                KERNEL   0   8.541 ms
+  KERNEL  76   8.550 ms                KERNEL   4   0.617 ms
+  KERNEL 127   9.955 ms                KERNEL  64   0.347 ms
+                                       KERNEL 127   0.378 ms
+  PHASE_G total  1370.67 ms            PHASE_G total    74.39 ms
+  ROUND 1..4  6.0 4.4 4.1 4.2 ms       ROUND 1..4  53.6 6.7 5.2 14.9 ms
+  VARIETY_COMPLETED_NO_DEADLOCK        VARIETY_COMPLETED_NO_DEADLOCK
+```
+
+**Three things, and the third was not what the probe was written to ask.**
+
+1. **The M4 does not hang.** 128 distinct kernels compile and launch in one
+   process and the program completes. The premise that the RTX 5090 hang is
+   specific to that backend survives its control, which it might not have.
+
+2. **Per-kernel cost is flat.** Cold, every kernel from 0 to 127 costs
+   roughly 8 to 13 ms with no trend. That kills a specific reading of the
+   NVIDIA hang -- that per-kernel JIT cost accumulates in-process and the
+   hang is simply the far end of a curve that never turns over. On Metal
+   there is no curve. Whatever NVIDIA is doing, it is not this.
+
+3. **Metal caches compiled kernels on disk, across processes.** The same
+   binary on the same machine took 1370 ms and then 74 ms, an 18x drop, with
+   the first kernel unchanged at 8.5 ms and every subsequent one falling to
+   under 1.4 ms. Nothing in the program changed between the runs, so the
+   amortization is outside it.
+
+The third one is the one to carry to NVIDIA, because
+`~/.nv/ComputeCache` holds **zero files** after a CUDA run. If that is
+accurate, then Metal amortizes kernel compilation across processes and CUDA
+recompiles everything from scratch every time, which is exactly the axis
+along which the working backend and the hanging backend differ. It is a
+hypothesis and not a result: the cheap test is to run this probe twice on the
+card and see whether run 2 is 18x faster or identical to run 1.
+
+**What this does NOT show.** Nothing about speed. These are microseconds of
+trivial arithmetic wrapped around a compile, and no number here belongs
+beside any training timing. The probe measures compilation and dispatch and
+was written to answer a yes-or-no question about hanging.
+
 ### NVIDIA RTX 5090, CUDA, 2026-08-18
 
 The first non-Metal execution in this project's history. Recorded from a
