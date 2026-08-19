@@ -80,9 +80,28 @@ which builds the bundle plan and then declines to apply it. It measured
 tracks the plan being APPLIED, and building one you do not use costs 15
 percent. That is also why the dense arm regresses.
 
-**What is not yet resolved:** whether the dense regression is a fixed
-plan-construction cost that amortizes away at realistic tree counts, or a
-per-tree cost. The two imply different defaults and the measurement is cheap.
+**RESOLVED, and it went the other way. The default stays OFF.** A third
+shape, 300,000 x 60 with 48 INDEPENDENT binary columns at 6 percent density,
+measures **0.485x at 25 trees and 0.862x at 150**. Bundling loses badly there,
+and the `min_reduction = 0.999` control says why: plan 0.698 s,
+bundled-histogram delta 0.013 s. Nothing bundled and we paid the whole
+conflict scan to find out.
+
+Two independent columns at 6 percent density collide on about 0.36 percent of
+rows, and `max_conflict_rate` accepts only 0.0, so ONE collision forbids the
+bundle. Covtype wins because its binary columns are ONE-HOT (soil type,
+wilderness area) and therefore exactly exclusive. Both shapes are realistic,
+so "sparse" is not the predicate; "mutually exclusive" is.
+
+The cost is FIXED, not per-tree, and our scan reads every row, which is what
+makes our bundling exactly lossless. LightGBM builds its conflict graph from
+the binning sample instead: cheaper, which is why they can default it on, and
+not actually conflict-free off the sample.
+
+**What would let the default flip: a sampled pre-screen.** Decide from a few
+thousand rows whether any bundle is possible at all, and only pay the exact
+full scan when the sample says yes. That keeps exact losslessness and drops
+the cost on data that cannot bundle. Not built.
 
 **Why the default cannot simply flip:** `efb.check_bundling_supported`
 RAISES whenever the run is not CPU, so `enable_bundle = True` as an

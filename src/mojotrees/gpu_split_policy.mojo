@@ -326,8 +326,13 @@ def split_device_note(api: String, arch: String) -> String:
         )
     if api.find("hip") >= 0 or api.find("rocm") >= 0:
         return String(
-            "no AMD device has ever executed this code (docs/AMD_GPU.md), so"
-            " nothing here is a claim about HIP. This fit takes the host scan"
+            "HIP has executed this code: an MI300X passed 22 assertions on"
+            " 2026-08-19 including a full training fit"
+            " (docs/GPU_VALIDATION.md). What is missing is the interleaved"
+            " host-against-device split sweep, which is a benchmark and not a"
+            " first run. Until it exists this fit takes the host scan. Check"
+            " /opt/rocm/.info/version first: MAX targets ROCm 6 and reports no"
+            " accelerator on ROCm 7, where the GPU path compiles out silently"
         )
     return String(
         "this backend is not in the validated table and has not been seen"

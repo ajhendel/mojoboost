@@ -2,10 +2,22 @@
 
 Written: 2026-08-14
 
-**No AMD device has ever executed a line of this code.** Not in CI, not on a
-workstation, not once. `docs/GPU_VALIDATION.md` is the record and every HIP
-row in it reads "not run". Nothing in this file is a claim about how
-mojotrees behaves or performs on AMD hardware.
+**AMD ran this code for the first time on 2026-08-19**, on a leased MI300X,
+and it passed 22 assertions including a full training fit. The record is
+`docs/GPU_VALIDATION.md`. This page was written on 2026-08-14 as a guide for
+whoever eventually ran it; most of it still stands and is now checkable rather
+than hypothetical.
+
+Nothing here is a performance claim. Correctness passed, determinism was only
+partly exercised, and no timing sweep or profiler trace was taken.
+
+**Check the ROCm version before you trust anything.** The first attempt used a
+ROCm 7 image, built cleanly in 27 seconds, and reported `no accelerator
+present` from every probe: MAX targets ROCm 6, found no HIP runtime it
+recognized, and `has_accelerator()` was false at comptime, so the entire GPU
+half of the package compiled out and the build still exited 0. The identical
+source on ROCm 6.4.1 worked completely. `cat /opt/rocm/.info/version` is the
+first command to run, and a green build proves nothing on its own.
 
 What this file is: how the portable contract in `docs/GPU_PORTABILITY.md`
 reads on HIP, what to look at first when someone finally runs it, and which

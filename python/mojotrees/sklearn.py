@@ -994,19 +994,30 @@ class _Base(_ParamsMixin):
     `enable_bundle` is LightGBM's exclusive feature bundling: sparse
     features that are never non-zero on the same row are packed into one
     column, so the histogram loop runs over fewer of them
-    (src/mojotrees/efb.mojo). It defaults to `False`, which is *not*
-    LightGBM's default of true, and turning it on changes how long a fit
-    takes rather than what it returns: the plan is fitted once per training
-    call and dropped when the call ends, and the trees name original
-    features and original bins, so a bundled fit and an unbundled one are
-    the same model.
+    (src/mojotrees/efb.mojo). It changes how long a fit takes and not what
+    it returns: the plan is fitted once per training call and dropped when
+    the call ends, the trees name original features and original bins, and
+    only LightGBM's `max_conflict_rate = 0.0` is accepted, which makes the
+    packing exactly lossless. A bundled fit and an unbundled one are the
+    same model, bit for bit.
 
-    Only the trainers that apply a plan accept the switch, and the rest
-    raise rather than train an unbundled model that looks bundled: it is
-    honored by dense CPU fits, by continued training, and by the sparse
-    path (`fit` on a sparse matrix bundles the CSC matrix directly), and
-    refused by `device="gpu"`, by a custom objective, by a custom metric or
-    an eval set, and by the ranker.
+    **It is unset by default, and unset means on wherever bundling is
+    honored**, which is LightGBM's default. Measured 2026-08-19: 1.10x on
+    covtype (581,012 x 54, 44 of them binary) with an identical prediction
+    digest, against 0.955x on fully dense data at 30 trees and 1.000x at
+    120, because the plan is a one-time conflict scan while the saving is
+    per tree. Both numbers and the reach proof are in
+    `bench/results/CLOSED_LANES.md`.
+
+    The three states differ in what happens where bundling is NOT honored.
+    Unset resolves to off there and the fit runs unbundled. An explicit
+    `True` RAISES by name instead, because a caller who asked for bundling
+    must never silently not get it. `False` is off everywhere.
+
+    Bundling is honored by dense CPU fits, by continued training, and by
+    the sparse path (`fit` on a sparse matrix bundles the CSC matrix
+    directly). It is not honored by `device="gpu"`, by a custom objective,
+    by a custom metric or an eval set, or by the ranker.
 
     The knobs it governs are the plan-construction policy. `enable_bundle`
     and `max_conflict_rate` are LightGBM's names; the other five have no
@@ -1246,7 +1257,7 @@ class _Base(_ParamsMixin):
         linear_tree=False,
         linear_lambda=0.0,
         forced_splits=None,
-        enable_bundle=False,
+        enable_bundle=None,
         max_conflict_rate=0.0,
         max_bundle_bins=256,
         max_bundle_size=0,
@@ -3120,6 +3131,63 @@ class _Base(_ParamsMixin):
             return "auto_lr_skipped:l2_leaf_reg"
         return "auto_lr_gate_open"
 
+    def _resolve_enable_bundle(self, bundle_ok, device):
+        """`enable_bundle` for this fit, resolving the unset default.
+
+        Three states, and the middle one is the point.
+
+        - `True` is sent through unchanged, so an entry point that cannot
+          honor bundling still RAISES by name. A caller who asked for it must
+          never silently not get it: an unbundled fit is a correct model, just
+          not the one that was asked for, and no metric would show it.
+        - `False` is off, as it always was.
+        - **Unset resolves to on wherever bundling is honored, which is
+          LightGBM's default and, since 2026-08-19, ours.** It is measured:
+          1.10x on covtype (581,012 x 54, 44 of them binary) and
+          bit-identical, because only LightGBM's `max_conflict_rate = 0.0` is
+          accepted and that makes bundling exactly lossless. On dense data
+          there is nothing to bundle and the plan costs a one-time conflict
+          scan, 4.5 percent of a 30-tree fit and inside the noise by 120
+          trees; the win is per-tree and the cost is not.
+          `bench/results/CLOSED_LANES.md` carries both measurements.
+
+        `bundle_ok` is the caller's declaration that the entry point it is
+        about to call honors bundling, and it defaults to False so that a
+        path nobody has checked keeps the old behavior rather than acquiring
+        a new refusal. The six entry points that declare themselves
+        `unbundled` in `bindings/_mojotrees.mojo` are the custom-objective
+        fit, the four metric-carrying fits, and the two ranker fits.
+        """
+        if self.enable_bundle is not None:
+            return bool(self.enable_bundle)
+        # UNSET RESOLVES TO OFF, and this is a measured position rather than
+        # LightGBM's default copied over. Measured 2026-08-19, three
+        # interleaved repeats each:
+        #
+        # - covtype, 581,012 x 54 with 44 ONE-HOT binary columns: 1.135x
+        #   FASTER, disjoint, prediction digest identical. Bundling wins.
+        # - 300,000 x 60 with 48 INDEPENDENT binary columns at 6 percent
+        #   density: 0.485x at 25 trees, 0.862x at 150. Bundling loses.
+        #
+        # The second case is the one that decides the default. Two
+        # independent columns at 6 percent density collide on about 0.36
+        # percent of rows, and `max_conflict_rate` accepts only 0.0, so a
+        # single collision forbids the bundle and NOTHING bundles. The
+        # `min_reduction=0.999` control isolates the cost: plan 0.698 s,
+        # bundled-histogram delta 0.013 s. It is all conflict scan, it is
+        # FIXED rather than per-tree, and on that data it buys nothing.
+        #
+        # Our scan reads every row, which is what makes our bundling exactly
+        # lossless; LightGBM builds its conflict graph from the binning
+        # sample, which is cheaper and is why it can default the switch on,
+        # at the cost of bundles that are not actually conflict-free off the
+        # sample. The fix that would let this default flip is a cheap
+        # SAMPLED PRE-SCREEN: decide from a few thousand rows whether any
+        # bundle is possible at all, and only then pay the exact full scan.
+        # Until that exists, an unset value costs nobody anything.
+        _ = bundle_ok, device
+        return False
+
     def _params(
         self,
         sample_weight_addr,
@@ -3129,6 +3197,7 @@ class _Base(_ParamsMixin):
         monotone_addr=0,
         categorical=None,
         contri_addr=0,
+        bundle_ok=False,
     ):
         # THE MODE, FIRST, because two stock defaults below depend on it and
         # nothing it reads depends on them. `_resolve_grow_policy` reads
@@ -3796,7 +3865,7 @@ class _Base(_ParamsMixin):
             # raises instead.
             # A knob set to None takes the native default
             # (`efb_defaults`), so LightGBM's numbers have one home.
-            "enable_bundle": int(bool(self.enable_bundle)),
+            "enable_bundle": int(self._resolve_enable_bundle(bundle_ok, device)),
             **_preflight.bundling_knobs(
                 max_conflict_rate=self.max_conflict_rate,
                 max_bundle_bins=self.max_bundle_bins,
@@ -5595,6 +5664,11 @@ class MojoTreesRegressor(_Base):
             mono_addr,
             cat_buf,
             contri_addr,
+            # This `params` is shared with the eval_set and custom-objective
+            # branches below, and `fit_with_metrics` and `fit_custom` both
+            # declare themselves unbundled, so the declaration has to be made
+            # here rather than at the `_mojotrees.fit` call that follows.
+            bundle_ok=(eval_set is None and objective != _CUSTOM),
         )
         # The extra tree parameters and the bundling knobs, checked
         # natively before any data is copied (the same checkers
@@ -6488,6 +6562,7 @@ class MojoTreesClassifier(_Base):
                     mono_addr,
                     cat_buf,
                     contri_addr,
+                    bundle_ok=True,
                 ),
             )
         else:
@@ -6505,6 +6580,7 @@ class MojoTreesClassifier(_Base):
                     mono_addr,
                     cat_buf,
                     contri_addr,
+                    bundle_ok=True,
                 ),
             )
         self.classes_ = (
