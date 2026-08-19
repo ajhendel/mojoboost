@@ -14,12 +14,28 @@ Three policies, each LightGBM's or scikit-learn's:
   the same total weight and the weights average to 1.
 - `scale_pos_weight` and `is_unbalance`, LightGBM's two binary-only knobs.
   `scale_pos_weight` multiplies the positive rows by a number you choose;
-  `is_unbalance` chooses it for you as `negatives / positives`, which is the
-  binary case of `balanced` up to a constant factor (`balanced` scales both
-  classes so the mean weight stays 1; `is_unbalance` leaves the negatives at
-  1 and lifts the positives). They are mutually exclusive in LightGBM, and
-  `check_class_balance_params` rejects the combination here rather than
-  silently letting one win.
+  `is_unbalance` chooses it for you as `negatives / positives`. They are
+  mutually exclusive in LightGBM, and `check_class_balance_params` rejects
+  the combination here rather than silently letting one win.
+
+  **`is_unbalance` is not `balanced` up to a constant factor.** A uniform
+  rescale of every row weight is not gain-invariant here: `lambda_l2`
+  defaults to 1.0 and `min_sum_hessian_in_leaf` to 1e-3, so scaling `G`
+  and `H` while `lambda_l2` stays fixed moves both
+  `G**2 / (H + lambda_l2)` and `-G / (H + lambda_l2)`, and the two
+  policies pick different splits and write different leaf values rather
+  than the same tree at a different scale. On a majority-positive label
+  they do not even agree on which class moves: `unbalance_scale` always
+  leaves the negatives at 1.0, so its multiplier is below 1.0 there and it
+  shrinks the positives, while LightGBM lifts whichever class is the
+  minority (`src/objective/binary_objective.hpp:93-101` at 4.7.0). The
+  ratio between the classes is the same in both, and that is the only part
+  the old claim had right.
+
+  A second difference from LightGBM in the same two knobs.
+  `unbalance_scale` derives its ratio from weighted class counts
+  (`class_counts` takes `sample_weight`) where LightGBM's `Init` counts
+  rows. On an unweighted fit the two coincide.
 
 Interaction with `sample_weight`: a class weight multiplies whatever row
 weight the caller already has, LightGBM's rule and scikit-learn's. So a row

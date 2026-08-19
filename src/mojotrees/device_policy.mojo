@@ -76,42 +76,43 @@ Three requested devices, and what each one means
 
 Where `auto` reaches the GPU, and where it still does not
 ---------------------------------------------------------
-`crossover_rules()` holds two rules, one single-output and one multiclass,
-and each is as narrow as the records behind it.
+`crossover_rules()` holds one rule, single output, and it is as narrow as
+the records behind it.
 
-The single-output rule's two records both measure end-to-end training on an
-Apple M4 over Metal at 1,000,000 rows by 50 dense features, 255 bins, 31
-leaves, 100 rounds, squared error, in interleaved CPU/GPU arms:
+Its two records both measure end-to-end training on an Apple M4 over Metal
+at 1,000,000 rows by 50 dense features, 255 bins, 31 leaves, 100 rounds,
+squared error, in interleaved CPU/GPU arms:
 `bench/results/apple_m4_large_scaling_2026-08-14.md` (GPU 4.289-4.382 s
 against CPU 11.094-11.706 s over three seeds) and the 2026-08-15 section of
 `docs/GPU_VALIDATION.md` (GPU 4.10 s against CPU 11.36 s over five
 repeats). So it fires on that device, for that objective, at 50 or more
 features, and nowhere else.
 
-The multiclass rule's one record is softmax on the same machine at 465,000
-rows by 54 dense features over 7 classes, same bins, leaves and rounds:
-`bench/results/profile_2026-08-15/RESULTS.md`, GPU 15.30 s against CPU 25.47
-s, medians of three at 0.1 and 7.7 percent spread, so the GPU wins by 1.63x
-with the two spreads nowhere near touching. It is scoped by trees per round
-rather than by objective code, because trees-per-round is what the trainers
-branch on and is the one fact every multiclass entry point declares; see
-`crossover_rules()` for why that is the exact scope and not a weakened one.
-Until 2026-08-16 there was no rule here at all, so `auto` handed every
-softmax fit the slower backend at every size.
+A multiclass rule stood here from 2026-08-16 and was withdrawn on evidence
+on 2026-08-18. It rested on one synthetic record, softmax at 465,000 rows by
+54 dense features over 7 classes (`bench/results/profile_2026-08-15/
+RESULTS.md`, GPU 15.30 s against CPU 25.47 s). Its own falsification clause
+asked for an interleaved pair at that shape where the GPU is not faster, and
+`bench/results/gbm_bench_2026-08-18/RESULTS.md` is one: real covertype at
+581,012 x 54 over 7 classes, six arms interleaved, three repeats, 2.9
+percent spread, GPU 40.894 s against CPU 28.077 s, the GPU 1.45x SLOWER.
+While the rule stood, `MojoTreesClassifier(device="auto")` on covertype
+resolved to the GPU and returned the slower of the two arms we ship. So a
+multiclass fit under `auto` gets the CPU today at every size, and that is a
+measured position rather than an absence of one. The withdrawal note in the
+body of `crossover_rules()` carries the full argument and keeps the
+constants, so a reinstatement is one `rules.append` rather than a scope
+reconstructed from prose.
 
 Every other backend, every other Apple generation, and every other objective
 still return "no rule covered this", because nothing here measured them.
 
-The *row floor* is a different kind of thing and is labelled as one. Both
-rules read `AUTO_GPU_MIN_ROWS`, a plain provisional constant at 250,000
+The *row floor* is a different kind of thing and is labelled as one. The
+rule reads `AUTO_GPU_MIN_ROWS`, a plain provisional constant at 250,000
 rows, set below the smallest shape either record covers, on a stated trade
 rather than on a measurement. Read the comment on that constant before
 changing it; the measured crossover is scheduled work and this is the
-placeholder standing in for it. One number for both is itself a decision and
-`crossover_rules()` argues it: a K-class fit does K times the tree work per
-round against the same one-time upload and session cost, so the multiclass
-crossover sits at or below the single-output one and reusing the constant
-cannot over-reach relative to that.
+placeholder standing in for it.
 
 That the table was empty for longer than the evidence warranted was a bug,
 not conservatism: `auto` selected the CPU at every size on every machine,
@@ -1947,9 +1948,13 @@ struct CrossoverEvidence(Copyable, Movable):
 def crossover_rules() raises -> List[CrossoverEvidence]:
     """The benchmark-derived crossover rules, in priority order.
 
-    Two rules, and they are disjoint: the first is single output, the second
-    is multiclass, and no request can match both. They share one row floor,
-    `AUTO_GPU_MIN_ROWS`, which is a provisional constant for both.
+    One rule, single output. It reads one row floor, `AUTO_GPU_MIN_ROWS`,
+    which is a provisional constant. The multiclass rule this docstring used
+    to describe beside it was withdrawn on evidence on 2026-08-18, and the
+    note above `return rules^` is the record. The multiclass material below
+    is kept as the argument a reinstatement would have to answer; it is
+    written in a present tense the code no longer supports, so read it
+    against that note rather than as a description of what `auto` does.
 
     The single-output rule, as arithmetic. `auto` selects the GPU when *all*
     of:

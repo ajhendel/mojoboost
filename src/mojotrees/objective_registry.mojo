@@ -343,11 +343,22 @@ comptime NO_OBJECTIVE_CODE = -1000
 #
 # `objective_reserved` below is the predicate, and it is deliberately outside
 # `objective_is_known`. Every one of these names a loss whose gradient loop is
-# merged and whose module is imported by nothing -- `catboost_ranking.mojo`,
-# `survival.mojo` and `multi_target.mojo` have zero importers anywhere in
-# `src/`, `bindings/`, `capi/` or `cli/`, including `__init__.mojo`. So the
+# merged, and two of the three modules are imported by nothing:
+# `catboost_ranking.mojo` and `survival.mojo` have zero importers anywhere in
+# `src/`, `bindings/`, `capi/` or `cli/`, including `__init__.mojo`, so those
 # trainers exist and only a hand-written Mojo call that imports the module
 # directly can reach them.
+#
+# `multi_target.mojo` is not one of them. `bindings/catboost_reach_bindings`
+# imports `MultiTargetModel`, `fit_multi_rmse` and `predict_multi_rmse` from
+# it, and `bindings/_mojotrees.mojo` imports the three wrappers and registers
+# them as `multi_rmse_fit`, `multi_rmse_shape` and `multi_rmse_predict`, so
+# MULTI_RMSE is reachable from Python through `python/mojotrees/
+# _multi_target.py` and the multi-output path of `MojoTreesRegressor`. What
+# stays true of it is the part this block is about: it is not a
+# `boosting.train` objective, `objective_is_builtin` is False for it, and
+# `boosting._check_objective` still refuses it, which is why its code lives
+# in the reserved negative space beside `MULTICLASS`.
 #
 # What is registered here is therefore the half that must be right BEFORE a
 # trainer is connected, not after: the number, the name it round-trips under,
