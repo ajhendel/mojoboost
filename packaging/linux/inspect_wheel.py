@@ -340,9 +340,18 @@ def _check_layout(zf, names, distinfo, pkg, res: Result) -> None:
 
     licenses = [
         n for n in names
-        if n.startswith(distinfo) and "LICENSE" in n.upper()
+        if n.startswith(distinfo)
+        and ("LICENSE" in n.upper() or "NOTICE" in n.upper())
     ]
-    res.rule("L5", bool(licenses), f"license files in dist-info: {licenses or 'none'}")
+    # Both, not either. The NOTICE is what Apache 2.0 section 4(d) makes
+    # binding on anyone who redistributes this wheel, and section 4(d) only
+    # bites if the NOTICE shipped as part of the Work.
+    res.rule(
+        "L5",
+        any("NOTICE" not in n.upper() for n in licenses)
+        and any("NOTICE" in n.upper() for n in licenses),
+        f"license and NOTICE in dist-info: {licenses or 'none'}",
+    )
     res.note("Every bundled runtime object needs its license text here too, and")
     res.note("the MAX runtime is proprietary. See packaging/linux/README.md.")
 

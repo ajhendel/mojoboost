@@ -280,6 +280,7 @@ readelf -d "$EXT" | grep -E 'RUNPATH|RPATH|NEEDED' || true
 
 note "building the wheel, platform tag $PLAT"
 cp LICENSE python/LICENSE
+cp NOTICE python/NOTICE
 SOURCE_DATE_EPOCH=$(git log -1 --pretty=%ct)
 export SOURCE_DATE_EPOCH
 (
