@@ -691,7 +691,23 @@ Host        RunPod secure cloud, EU-RO-1, Ubuntu 24.04.3
 GPU         NVIDIA GeForce RTX 4090 (Ada, sm_89)
 CUDA host   13.0
 Commit      98f4905
+Driver      NOT CAPTURED
 ```
+
+**The missing driver is a real weakness in this record, found 2026-08-19 while
+setting up a bisect.** MAX requires NVIDIA driver 580 or later. The RTX 5090
+record states `580.159.03` and is solid. This run's script never called
+`nvidia-smi`, so the driver was not recorded and the pod is destroyed.
+
+It matters because RunPod hands out both: a 4090 leased minutes later in the
+same datacenter reported `570.172.08`, which is BELOW the floor. If this pod
+was also on 570, its hang is a result on an unsupported configuration and
+cannot be quoted as a second architecture confirming the 5090.
+
+So the claim "the hang reproduces on two architectures" is currently
+UNVERIFIED at its second point. The 5090 result stands on its own. Every probe
+from now on prints the driver and refuses to run below 580, which is a gate
+that should have existed from the first NVIDIA run.
 
 ```text
 build                          rc=0   19.7 s
@@ -717,9 +733,11 @@ which is the same parked signature as the 5090 rather than slowness.
 | `test_gpu_training` | never returns | rc=124 at 601 s |
 
 Two architectures two generations apart, two CUDA versions, two datacenters,
-two host CPUs. **The hang is not a Blackwell quirk, not one bad host, and not
-a driver version.** Every earlier CUDA finding rested on a single machine;
-this one does not.
+two host CPUs. That was written as **the hang is not a Blackwell quirk, not
+one bad host, and not a driver version**, and the last third of that sentence
+is not supported: this run's driver was never captured, and a driver is
+exactly the variable it claimed to rule out. See the note above. The 5090
+result is unaffected.
 
 #### The cache hypothesis is dead, and CUDA killed it
 
