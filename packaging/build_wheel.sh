@@ -44,5 +44,6 @@ for lib in "${LIBS[@]}"; do
 done
 
 cp LICENSE python/LICENSE
+cp NOTICE python/NOTICE
 (cd python && python -m build --wheel --no-isolation)
 ls -l python/dist/

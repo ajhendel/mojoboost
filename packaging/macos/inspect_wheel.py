@@ -331,15 +331,21 @@ def inspect(path: Path, rep: Report) -> dict:
             if re.search(r"\.dist-info/(licenses/)?(LICENSE|COPYING|NOTICE)", n)
         ]
         sizes = {n: zf.getinfo(n).file_size for n in license_members}
+        has_license_text = any("NOTICE" not in n.upper() for n in license_members)
+        has_notice = any("NOTICE" in n.upper() for n in license_members)
         rep.check(
             "C10b",
-            bool(license_members) and all(v > 0 for v in sizes.values()),
-            f"license file shipped: {sizes or 'NONE'}",
-            [] if license_members else [
-                "python/pyproject.toml declares license-files = [\"LICENSE\"],"
-                " and packaging/build_wheel.sh copies LICENSE into python/"
-                " before the build. A wheel without it means that copy did not"
-                " happen."
+            has_license_text and has_notice and all(v > 0 for v in sizes.values()),
+            f"license and NOTICE shipped: {sizes or 'NONE'}",
+            [] if (has_license_text and has_notice) else [
+                "python/pyproject.toml declares"
+                " license-files = [\"LICENSE\", \"NOTICE\"], and"
+                " packaging/build_wheel.sh copies both into python/ before the"
+                " build. A wheel missing either means that copy did not happen.",
+                "NOTICE is not optional here. Apache 2.0 section 4(d) binds a"
+                " redistributor to reproduce it only if it was distributed as"
+                " part of the Work, so a wheel without it is a wheel that"
+                " carries no attribution obligation at all.",
             ],
         )
 
