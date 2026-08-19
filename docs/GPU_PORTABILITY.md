@@ -1,18 +1,50 @@
 # GPU portability contract
 
-Written: 2026-08-14. Section 6 added 2026-08-15.
+Written: 2026-08-14. Section 6 added 2026-08-15. Priority restated
+2026-08-19.
 
-mojotrees has one GPU source. `docs/GPU_VALIDATION.md` states that
-commitment and holds the record of what has actually run on hardware. This
-document is the other half: **what the one source requires of a backend**,
-which of those requirements every supported API specifies, which assumptions
-in the tree are Apple-shaped rather than portable, and where a backend may
-specialize without forking the source.
+## What is actually being committed to
 
-Nothing here is a claim about NVIDIA or AMD behavior. Only Metal has
-executed a kernel from this repository, on one Apple M4. Everything below
-about CUDA and HIP is a statement about what those APIs specify, or about
-what the code in this tree does, not about anything anyone observed.
+**Portability is the commitment. One source is the means.** Those are not the
+same promise, and until 2026-08-19 this document ran them together.
+
+Running well on Apple Silicon, NVIDIA and AMD is the product. A change that
+wins speed on one vendor by abandoning another is refused whatever the number
+says.
+
+Single-source compilation is how that is delivered today, and it is a means
+rather than a principle. A hand-written per-backend path is permitted when it
+is measured and priced. Two things should be weighed honestly before taking
+one, because the appeal of a specialized kernel is always obvious and its
+costs are not:
+
+- **Maintenance.** One source is the only affordable way a very small team
+  ships CUDA, Metal and HIP at once. Every forked path is a permanent
+  obligation on every future change, not a one-time cost.
+- **Cross-device identity becomes unreachable.** This is not hypothetical.
+  XGBoost has the fixed-point mechanism that makes summation order
+  independent and ships it by default in its GPU tree builder; its CPU
+  histogram accumulates in double-precision float. Two separately written
+  backends drifted into two different number systems, and no ordering
+  discipline on either side can close that. If bit-identity across devices
+  matters to a decision, a fork forecloses it.
+
+`gpu_portability.require_specializations_allowed` is the right shape for
+this: specialize behind a measurement, never behind a hunch.
+
+## What this document covers
+
+`docs/GPU_VALIDATION.md` holds the record of what has actually run on
+hardware. This document is the other half: **what the shared source requires
+of a backend**, which of those requirements every supported API specifies,
+which assumptions in the tree are Apple-shaped rather than portable, and
+where a backend may specialize without forking.
+
+Nothing here is a claim about AMD behavior, and claims about NVIDIA are
+limited to what section 6 and `docs/GPU_VALIDATION.md` record from the one
+RTX 5090 run. Everything else below about CUDA and HIP is a statement about
+what those APIs specify, or about what the code in this tree does, not about
+anything anyone observed.
 
 The Mojo modules that carry this contract are:
 
@@ -132,7 +164,19 @@ have no Float64, so leaf values, base scores, gradients, and hessians are
 Float32 on the device and histogram accumulation is fixed-point Int32.
 
 This is Apple's floor imposed on every backend, and it is the right call for
-one source, but it is a real cost on CUDA and HIP, which have Float64. It is
+one source, but it is a real cost on CUDA and HIP, which have Float64.
+
+**Reopened 2026-08-19.** Under the restated priority above, a Float64 path on
+a backend that has it is no longer ruled out on principle. Two facts belong
+next to that decision before anyone spends effort on it. Consumer NVIDIA parts
+run Float64 at roughly a sixty-fourth of their Float32 rate, and the only
+NVIDIA device this project has ever executed on is a consumer RTX 5090, so on
+that class of hardware Float64 is likely a large slowdown rather than a win;
+the 1:2 rate that makes it cheap belongs to datacenter parts. And the
+accumulation is already fixed-point Int32, which is both faster than Float64
+and exact, so there is no precision to recover in the histogram. If Float64
+earns its place it will be as an accuracy lever somewhere else in the
+objective, not as a speed lever here. Measure before adopting. It is
 recorded as `BackendContract.device_float64_permitted = False` on every
 backend rather than left as a comment, and
 `gpu_portability.require_device_float64` is the one place a future Float64
