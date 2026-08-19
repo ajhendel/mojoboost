@@ -227,11 +227,33 @@ and bump `device_policy.POLICY_VERSION`.
 
 ### 7. Packed-bin alignment
 
-The window arithmetic is not re-derived. Both modules call
-`gpu_histogram_specializations.plan_packed_window_for`, which takes a
-`BinStorageDescriptor` and refuses every layout the four-lane arithmetic is
-false for. Re-deriving a byte offset in a backend module is precisely how a
-second copy comes to read the wrong bytes.
+The window arithmetic is not re-derived in a backend module:
+`packed_body_transactions` in `gpu_vendor_policy.mojo` takes a
+`PackedLoadWindow` as an argument and reads its `body_quads`. Re-deriving a
+byte offset in a backend module is precisely how a second copy comes to read
+the wrong bytes.
+
+**Open defect: the storage guard is unreachable.**
+`plan_packed_window_for`, which takes a `BinStorageDescriptor` and refuses
+every layout the four-lane arithmetic is false for, has no callers anywhere in
+the repository. The one production planner,
+`apple_histogram_policy.derive_histogram_plan`, calls the bare
+`plan_packed_window` at `src/mojotrees/apple_histogram_policy.mojo:632` with a
+row count, and it cannot do otherwise as written, because `HistogramWorkload`
+carries no `BinStorageDescriptor` at all. The bare planner checks that the
+rows are a contiguous run, that the column stride is a multiple of
+`PACK_LANES`, and that the body clears `MIN_PACKED_BODY_QUADS`; it cannot
+check that one cell is one byte, which is the assumption the arithmetic rests
+on. So `WINDOW_STORAGE_NOT_BYTES` is an unreachable decline reason and
+`window_reason_name` can never answer `storage_is_not_one_byte_per_cell`.
+
+This costs nothing in any build shipped so far, and that is a property of the
+build rather than of the code: `KernelFeatures.packed_bin_loads` is false
+everywhere, so no packed window is acted on whatever it says. It costs
+correctness the day the packed kernel is compiled in, because the plan would
+be derived against a packed or blocked bin matrix as though each cell were a
+byte, which reads the wrong bytes rather than running slower. The fix is a
+descriptor field on `HistogramWorkload` and one call site.
 
 What each module adds is the transaction unit the window is measured in.
 
