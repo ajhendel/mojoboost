@@ -1522,3 +1522,35 @@ rebuilds this, that is the first thing to explain.
 fill the width table without also building the row-major copy of every bin id,
 which is a reasonable thing to want, and the row-major blocked kernel's
 private partials already use the same table.
+
+## Cutting the CUDA kernel matrix. DECLINED 2026-08-18, hypothesis falsified.
+
+**Do not re-propose this as a fix for the CUDA hang.** It was built, tested on
+the hardware, and changed nothing.
+
+`enqueue_range_histogram` instantiates two kernel families across five GROUP
+rungs and four BIN_CAP rungs: forty kernels. `gpu_tiling`'s own comment warned
+that "every rung is a kernel instantiation the whole matrix pays compile time
+for on every backend", and the CUDA arm hangs with
+`libKGENCompilerRTShared` blocked inside a `libcuda` call with an empty
+`~/.nv/ComputeCache`. Kernel-variant count was the best-supported of the
+remaining explanations.
+
+A build constant collapsed each ladder so the family emitted **twelve** kernels
+instead of forty, verified to build and to leave every CPU digest untouched.
+
+**Both tests still hung at 600 s.** The matrix is exonerated, and the constant
+is reverted rather than left in the dispatch: it buys nothing and a switch that
+outlives a negative measurement is a defect.
+
+**Eleven hypotheses are now dead**, including four MAX-only probes covering
+allocation, pinned buffers, copies without drain, launches, queue depth,
+sub-buffers and eight concurrent workers. Every primitive is individually
+sound. What remains is inside Modular's kernel-compiler runtime, which we
+cannot reach, and the next step is an upstream report rather than a change
+here.
+
+**One correction the CUDA session flagged and it is worth repeating**: an
+earlier backtrace that placed the deadlock in `enqueueCreateBuffer` was taken
+from the parent process. The binary forks; the parent sits correctly in
+`sigsuspend` while the child wedges. Do not build on that reading.

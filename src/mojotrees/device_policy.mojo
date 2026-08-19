@@ -2853,6 +2853,42 @@ def _collect_warnings(
     # never been measured at all, so a claim about which arm is faster there
     # would be the kind of one-backend fact stated as a general property that
     # this repository has paid for three times.
+    # WIDENED 2026-08-18 to every non-M4 GPU, not just Metal.
+    #
+    # The first version was Metal-only, on the reasoning that the 1.29x-1.85x
+    # slowdown was measured on Metal and a one-backend number should not be
+    # stated as a general property. That reasoning was right about the SPEED
+    # and wrong about the SILENCE. `_is_observed_m4` requires both the Metal
+    # api and the M4 generation, so a CUDA or HIP device fails it too and
+    # takes the host scan exactly as an M3 does -- and the host scan does not
+    # produce the same model as the device scan on ANY backend, because the
+    # two differ in precision and in when they dequantize. That part is not a
+    # Metal fact.
+    #
+    # So the warning now fires for every GPU that is not the validated M4, and
+    # it says what is known on each: on Metal, measured slower; elsewhere,
+    # unmeasured. A CUDA benchmark taken while this fires silently would be
+    # measuring the host scan under a GPU label, which is the defect this
+    # repository has already shipped once on multiclass.
+    if (
+        caps.profile.api != API_METAL
+        or caps.profile.apple_generation != APPLE_GEN_M4
+    ):
+        if caps.profile.api != API_METAL:
+            warnings.add(
+                WARN_UNKNOWN_HARDWARE,
+                String(
+                    "the device-resident split search is gated on the Apple"
+                    " M4, the only device its crossover has been measured on,"
+                    " so this fit takes the host scan instead. That does NOT"
+                    " produce the same model as the device scan: the two"
+                    " differ in precision and in when they dequantize. Which"
+                    " of the two is faster on this hardware is unmeasured."
+                    " Set MOJOTREES_GPU_SPLIT_STRATEGY=device to take the"
+                    " device arm anyway, and do not publish a benchmark taken"
+                    " while this warning fires without saying which arm ran"
+                ),
+            )
     if (
         caps.profile.api == API_METAL
         and caps.profile.apple_generation != APPLE_GEN_M4

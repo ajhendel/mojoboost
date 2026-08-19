@@ -334,15 +334,7 @@ from .gpu_packed_bins import (
 )
 from .gpu_histogram_specializations import MAX_BINS
 from .gpu_tiling import (
-    HIST_CAP_R0,
-    HIST_CAP_R1,
-    HIST_CAP_R2,
-    HIST_CAP_R3,
     HIST_FEATURE_GROUP_LADDER,
-    HIST_GROUP_R0,
-    HIST_GROUP_R1,
-    HIST_GROUP_R2,
-    HIST_GROUP_R3,
     HIST_FEATURE_GROUP_MAX,
     STRATEGY_ATOMIC,
     STRATEGY_TILED,
@@ -8858,8 +8850,8 @@ struct GpuActiveRows(Movable):
         launch was not sized for.
         """
         var group = self._launch_group(n_slots)
-        if group >= HIST_GROUP_R0:
-            self._enqueue_partial_at[HIST_GROUP_R0](
+        if group >= 16:
+            self._enqueue_partial_at[16](
                 bins,
                 grad,
                 hess,
@@ -8876,8 +8868,8 @@ struct GpuActiveRows(Movable):
                 n_tiles,
                 threads,
             )
-        elif group >= HIST_GROUP_R1:
-            self._enqueue_partial_at[HIST_GROUP_R1](
+        elif group >= 8:
+            self._enqueue_partial_at[8](
                 bins,
                 grad,
                 hess,
@@ -8894,8 +8886,8 @@ struct GpuActiveRows(Movable):
                 n_tiles,
                 threads,
             )
-        elif group >= HIST_GROUP_R2:
-            self._enqueue_partial_at[HIST_GROUP_R2](
+        elif group >= 4:
+            self._enqueue_partial_at[4](
                 bins,
                 grad,
                 hess,
@@ -8912,8 +8904,8 @@ struct GpuActiveRows(Movable):
                 n_tiles,
                 threads,
             )
-        elif group >= HIST_GROUP_R3:
-            self._enqueue_partial_at[HIST_GROUP_R3](
+        elif group >= 2:
+            self._enqueue_partial_at[2](
                 bins,
                 grad,
                 hess,
@@ -9063,8 +9055,8 @@ struct GpuActiveRows(Movable):
             hist_bins = _any_origin_u8(self.cbins_dev.unsafe_ptr())
             hist_rows = _any_origin_i32(self.ident_dev.unsafe_ptr())
             hist_gq = _any_origin_i32(self.cgq_dev.unsafe_ptr())
-        if self.bin_cap <= HIST_CAP_R0:
-            self.ctx.enqueue_function[_range_hist_partial_kernel[GROUP, HIST_CAP_R0]](
+        if self.bin_cap <= 32:
+            self.ctx.enqueue_function[_range_hist_partial_kernel[GROUP, 32]](
                 hist_bins,
                 hist_rows,
                 grad,
@@ -9094,8 +9086,8 @@ struct GpuActiveRows(Movable):
                 grid_dim=(blocks, n_tiles),
                 block_dim=threads,
             )
-        elif self.bin_cap <= HIST_CAP_R1:
-            self.ctx.enqueue_function[_range_hist_partial_kernel[GROUP, HIST_CAP_R1]](
+        elif self.bin_cap <= 64:
+            self.ctx.enqueue_function[_range_hist_partial_kernel[GROUP, 64]](
                 hist_bins,
                 hist_rows,
                 grad,
@@ -9125,8 +9117,8 @@ struct GpuActiveRows(Movable):
                 grid_dim=(blocks, n_tiles),
                 block_dim=threads,
             )
-        elif self.bin_cap <= HIST_CAP_R2:
-            self.ctx.enqueue_function[_range_hist_partial_kernel[GROUP, HIST_CAP_R2]](
+        elif self.bin_cap <= 128:
+            self.ctx.enqueue_function[_range_hist_partial_kernel[GROUP, 128]](
                 hist_bins,
                 hist_rows,
                 grad,
@@ -9157,7 +9149,7 @@ struct GpuActiveRows(Movable):
                 block_dim=threads,
             )
         else:
-            self.ctx.enqueue_function[_range_hist_partial_kernel[GROUP, HIST_CAP_R3]](
+            self.ctx.enqueue_function[_range_hist_partial_kernel[GROUP, 256]](
                 hist_bins,
                 hist_rows,
                 grad,
@@ -9218,8 +9210,8 @@ struct GpuActiveRows(Movable):
     ) raises:
         """The atomic twin of `_enqueue_partial_family`, same static tree."""
         var group = self._launch_group(n_slots)
-        if group >= HIST_GROUP_R0:
-            self._enqueue_atomic_at[HIST_GROUP_R0](
+        if group >= 16:
+            self._enqueue_atomic_at[16](
                 bins,
                 grad,
                 hess,
@@ -9240,8 +9232,8 @@ struct GpuActiveRows(Movable):
                 threads,
                 use_desc,
             )
-        elif group >= HIST_GROUP_R1:
-            self._enqueue_atomic_at[HIST_GROUP_R1](
+        elif group >= 8:
+            self._enqueue_atomic_at[8](
                 bins,
                 grad,
                 hess,
@@ -9262,8 +9254,8 @@ struct GpuActiveRows(Movable):
                 threads,
                 use_desc,
             )
-        elif group >= HIST_GROUP_R2:
-            self._enqueue_atomic_at[HIST_GROUP_R2](
+        elif group >= 4:
+            self._enqueue_atomic_at[4](
                 bins,
                 grad,
                 hess,
@@ -9284,8 +9276,8 @@ struct GpuActiveRows(Movable):
                 threads,
                 use_desc,
             )
-        elif group >= HIST_GROUP_R3:
-            self._enqueue_atomic_at[HIST_GROUP_R3](
+        elif group >= 2:
+            self._enqueue_atomic_at[2](
                 bins,
                 grad,
                 hess,
@@ -9448,8 +9440,8 @@ struct GpuActiveRows(Movable):
         # wide, and a pointer cannot be handed down from a caller that also
         # holds `mut self`.
         var desc = self._desc_buffer()
-        if self.bin_cap <= HIST_CAP_R0:
-            self.ctx.enqueue_function[_range_hist_atomic_kernel[GROUP, HIST_CAP_R0]](
+        if self.bin_cap <= 32:
+            self.ctx.enqueue_function[_range_hist_atomic_kernel[GROUP, 32]](
                 hist_bins,
                 hist_rows,
                 grad,
@@ -9484,8 +9476,8 @@ struct GpuActiveRows(Movable):
                 grid_dim=(blocks, n_tiles),
                 block_dim=threads,
             )
-        elif self.bin_cap <= HIST_CAP_R1:
-            self.ctx.enqueue_function[_range_hist_atomic_kernel[GROUP, HIST_CAP_R1]](
+        elif self.bin_cap <= 64:
+            self.ctx.enqueue_function[_range_hist_atomic_kernel[GROUP, 64]](
                 hist_bins,
                 hist_rows,
                 grad,
@@ -9520,8 +9512,8 @@ struct GpuActiveRows(Movable):
                 grid_dim=(blocks, n_tiles),
                 block_dim=threads,
             )
-        elif self.bin_cap <= HIST_CAP_R2:
-            self.ctx.enqueue_function[_range_hist_atomic_kernel[GROUP, HIST_CAP_R2]](
+        elif self.bin_cap <= 128:
+            self.ctx.enqueue_function[_range_hist_atomic_kernel[GROUP, 128]](
                 hist_bins,
                 hist_rows,
                 grad,
@@ -9557,7 +9549,7 @@ struct GpuActiveRows(Movable):
                 block_dim=threads,
             )
         else:
-            self.ctx.enqueue_function[_range_hist_atomic_kernel[GROUP, HIST_CAP_R3]](
+            self.ctx.enqueue_function[_range_hist_atomic_kernel[GROUP, 256]](
                 hist_bins,
                 hist_rows,
                 grad,
