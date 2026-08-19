@@ -93,6 +93,8 @@ def patch_algorithms(root):
         "            return MojoTreesCPUAlgorithm()\n"
         "        if name == 'mojotrees-gpu':\n"
         "            return MojoTreesGPUAlgorithm()\n"
+        "        if name == 'mojotrees-gpu-compact':\n"
+        "            return MojoTreesGPUCompactAlgorithm()\n"
         "        if name == 'lgbm-cpu-det':\n"
         "            return LgbmCPUDeterministicAlgorithm()\n"
         "        raise ValueError(\"Unknown algorithm: \" + name)",
@@ -105,6 +107,7 @@ def patch_algorithms(root):
         "from mojotrees_algorithm import (  # noqa: E402\n" \
         "    MojoTreesCPUAlgorithm,\n" \
         "    MojoTreesGPUAlgorithm,\n" \
+        "    MojoTreesGPUCompactAlgorithm,\n" \
         "    LgbmCPUDeterministicAlgorithm,\n" \
         ")\n"
 
@@ -127,8 +130,8 @@ def main():
         raise SystemExit("not a gbm-bench checkout: " + root)
     install_adapter(root)
     patch_algorithms(root)
-    print("\nready. mojotrees-cpu and mojotrees-gpu are now valid -algorithm "
-          "values.")
+    print("\nready. mojotrees-cpu, mojotrees-gpu and mojotrees-gpu-compact "
+          "are now valid -algorithm values.")
 
 
 if __name__ == "__main__":

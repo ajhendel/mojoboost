@@ -581,19 +581,38 @@ run 1, cold                          run 2, warm
    hang is simply the far end of a curve that never turns over. On Metal
    there is no curve. Whatever NVIDIA is doing, it is not this.
 
-3. **Metal caches compiled kernels on disk, across processes.** The same
-   binary on the same machine took 1370 ms and then 74 ms, an 18x drop, with
-   the first kernel unchanged at 8.5 ms and every subsequent one falling to
-   under 1.4 ms. Nothing in the program changed between the runs, so the
-   amortization is outside it.
+3. **Something amortizes kernel compilation across processes here, and it is
+   probably not MAX.** The same binary on the same machine took 1370 ms and
+   then 74 ms, an 18x drop, with the first kernel unchanged at 8.5 ms and
+   every subsequent one falling under 1.4 ms. Nothing in the program changed
+   between the runs, so whatever is saving the work is outside it.
 
-The third one is the one to carry to NVIDIA, because
-`~/.nv/ComputeCache` holds **zero files** after a CUDA run. If that is
-accurate, then Metal amortizes kernel compilation across processes and CUDA
-recompiles everything from scratch every time, which is exactly the axis
-along which the working backend and the hanging backend differ. It is a
-hypothesis and not a result: the cheap test is to run this probe twice on the
-card and see whether run 2 is 18x faster or identical to run 1.
+**A correction, made the same day and before this left the repository.** The
+first version of this section said "Metal caches compiled kernels on disk,
+across processes" as though the mechanism were established. The 18x is
+measured and stands. The mechanism was inferred, and `docs/STARTUP_LATENCY.md`
+had already audited exactly this question against the MAX documentation and
+concluded the opposite: MAX's documented cache is per-`DeviceContext`,
+in-memory, in-process, and dies with the context, and **no on-disk cache for
+Mojo GPU kernels is documented anywhere**. That audit even anticipated this
+measurement -- "if it turns out to be [cached across processes],
+`kernel_create` will simply be small, and that is a measurement, not an
+assumption to build on."
+
+So the honest reading is that macOS caches compiled Metal shaders at the
+operating-system level, below and outside MAX entirely, which is a thing
+Apple's stack is known to do and a thing Linux with NVIDIA has no equivalent
+of by default. That is still a guess. What is not a guess is that the same
+work costs 18x less the second time on this machine.
+
+Either way it is the asymmetry to carry to the card, because
+`~/.nv/ComputeCache` holds **zero files** after a CUDA run. If the effect is
+real and absent there, then the backend that works pays for kernel
+compilation once and the backend that hangs pays every process. The cheap
+test is to run this probe twice on the RTX 5090 and see whether run 2 is 18x
+faster or identical to run 1. **Run that before filing anything upstream:** a
+report that names the wrong mechanism costs the reader more than one that
+names none.
 
 **What this does NOT show.** Nothing about speed. These are microseconds of
 trivial arithmetic wrapped around a compile, and no number here belongs

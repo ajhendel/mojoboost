@@ -6130,11 +6130,27 @@ class MojoTreesClassifier(_Base):
       does not mention keeps weight 1.0, and a key that is not one of the
       training labels is an error rather than a line with no effect.
 
-    LightGBM's binary-only `scale_pos_weight` is `class_weight={1: w}` here,
-    and its `is_unbalance` is `class_weight="balanced"` up to a constant
-    factor (`balanced` keeps the mean weight at 1; `is_unbalance` leaves the
-    negatives at 1 and lifts the positives). src/mojotrees/class_weight.mojo
-    has both under their LightGBM names for the Mojo API.
+    LightGBM's two binary-only knobs, `scale_pos_weight` and
+    `is_unbalance`, are in src/mojotrees/class_weight.mojo under those
+    names for the Mojo API. **They are not the same mechanism as this
+    parameter.** LightGBM keeps its class weight in `label_weights_`
+    (`src/objective/binary_objective.hpp:89-103` at 4.7.0) and multiplies
+    it into the gradient and the hessian only (`:114-134`); its
+    `BoostFromScore` (`:139-165`) reads `metadata.weights()` and never
+    `label_weights_`, so its init score is the base rate of the unweighted
+    sample and a class weight there moves no validation number and no
+    early-stopping decision. Here a class weight becomes an ordinary row
+    weight before any trainer runs (`_class_weight_rows` below), and a row
+    weight is read by everything: `boosting._base_score` takes the
+    weighted mean and returns `log(p / (1 - p))` from it, so the init
+    score is shifted, and every eval metric is class-weighted, so early
+    stopping stops somewhere else. Same numbers in, different model out.
+    That is the design and it is kept: one weighting mechanism rather than
+    two is what makes a class-weighted fit bit-identical to the same fit
+    with those row weights passed by hand. What it is not is a port
+    target, so a LightGBM script that sets `scale_pos_weight` will not
+    reproduce its trace here even where the gradient scaling matches.
+    `docs/LIGHTGBM_PARITY.md` carries it as a declared divergence.
 
     Weighting is not calibration. A class-weighted model's probabilities are
     probabilities under the reweighted sample, so `"balanced"` on a rare
