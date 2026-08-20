@@ -20,6 +20,7 @@
 #   MJT_DATASET  gbm-bench dataset         (default covtype)
 #   MJT_NTREES   trees per arm             (default 100)
 #   MJT_REPEATS  interleaved repeats       (default 3)
+#   MJT_ARMS     explicit gbm-bench arm list, overriding the default set
 set -uo pipefail
 exec 2>&1
 
@@ -105,7 +106,13 @@ echo "MJT CATBOOST_IMPORT_RC=$CATOK"
 PYTHONPATH=/root/mojotrees/python pixi run -e bench python -c \
   "import mojotrees;print('mojotrees',mojotrees.__version__,'gpu_available',mojotrees.gpu_available())" 2>&1 | tail -4
 
-if [ "$CATOK" -eq 0 ]; then
+# MJT_ARMS exists for one reason: on CUDA a mojotrees-gpu fit does not return.
+# Including that arm on an NVIDIA box does not produce a slow number, it burns
+# the repeat's whole timeout and takes the other five arms down with it, so
+# that box runs an explicit list without it. See docs/UPSTREAM_MAX_CUDA_HANG.md.
+if [ -n "${MJT_ARMS:-}" ]; then
+  ARMS="$MJT_ARMS"
+elif [ "$CATOK" -eq 0 ]; then
   ARMS="full"
 else
   ARMS="mojotrees-cpu,mojotrees-gpu,lgbm-cpu,lgbm-cpu-det,xgb-cpu"
