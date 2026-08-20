@@ -96,12 +96,35 @@ echo "==> running: dataset=$DATASET ntrees=$NTREES algorithms=$ALGOS"
 echo "    the harness downloads $DATASET into $DATA on first use; some of"
 echo "    these datasets are tens of GB, so check free space before airline"
 echo "    or bosch."
+# THREAD COUNT, WHICH IS NOT OPTIONAL IN A CONTAINER.
+#
+# gbm-bench's -cpus defaults to 0, which it resolves to the processor count
+# the OS reports. On a leased container that is the HOST core count, not the
+# cgroup quota: RunPod advertises 128 to 256 CPUs against quotas of 15 to 27.
+# Every arm then oversubscribes by an order of magnitude and no number from
+# the run means anything.
+#
+# GBM_BENCH_CPUS is passed straight through to gbm-bench's own -cpus, which
+# reaches LightGBM's nthread, XGBoost's nthread, CatBoost's thread_count and
+# our MOJOTREES_NUM_WORKERS from one place. It is an argument the harness
+# already exposes and it lands on every arm identically, so it does not
+# forfeit the restraint this directory exists to demonstrate. Setting one
+# library's thread count and not another's would.
+#
+# On a bare-metal box leave it unset and the upstream default applies.
+CPUS_ARG=()
+if [ -n "${GBM_BENCH_CPUS:-}" ]; then
+  echo "==> pinning every arm to $GBM_BENCH_CPUS threads (container cgroup quota)"
+  CPUS_ARG=(-cpus "$GBM_BENCH_CPUS")
+fi
+
 cd "$WORK"
 "$PY_BIN" runme.py \
   -root "$DATA" \
   -dataset "$DATASET" \
   -algorithm "$ALGOS" \
   -ntrees "$NTREES" \
+  "${CPUS_ARG[@]}" \
   -output "$OUT" \
   -verbose
 
