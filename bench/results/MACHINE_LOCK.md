@@ -180,13 +180,13 @@ it has been there since `24e5330` on 2026-08-15. Read every regime label in
 that results directory accordingly.
 
 **The pointer to the real commands was also dangling.** This paragraph used to
-end by sending the reader to `handoffs/performance_17_thermal_energy.md (deleted, recover with git log --all --diff-filter=D -- handoffs/performance_17_thermal_energy.md)`. That
+end by sending the reader to `handoffs/performance_17_thermal_energy.md`. That
 file was deleted on 2026-08-14 in `21ff9fa`, two days before this document was
 written; `bench/apple/thermal_capture.sh --self-check` fails on its absence with
 exit code 4. Until it is restored, use `docs/APPLE_THERMAL_ENERGY.md`, or
 recover the original with
 
-    git show 21ff9fa^:handoffs/performance_17_thermal_energy.md (deleted, recover with git log --all --diff-filter=D -- handoffs/performance_17_thermal_energy.md)
+    git show 21ff9fa^:handoffs/performance_17_thermal_energy.md
 
 The commands are reproduced verbatim in
 `bench/results/INSTRUCTION_AUDIT.md` section 10, with the privileged ones

@@ -801,7 +801,7 @@ treat it as a rule that is not yet habit.
 
 The script stays where it is, because the plan it prints is a real plan. **But
 the pointer this paragraph used to give was itself dangling**, and the audit
-caught it: `handoffs/performance_17_thermal_energy.md (deleted, recover with git log --all --diff-filter=D -- handoffs/performance_17_thermal_energy.md)` was deleted on
+caught it: `handoffs/performance_17_thermal_energy.md` was deleted on
 2026-08-14 in `21ff9fa`, two days before this section was written to point at
 it. `bench/apple/thermal_capture.sh --self-check` fails, exit code 4, on
 exactly that missing file, and its `--execute` refusal message sends the reader
@@ -811,7 +811,7 @@ Until it is restored, the surviving listing of the privileged commands is
 `docs/APPLE_THERMAL_ENERGY.md`, sections at lines 167-173 and 426-438, and the
 full original is one command away:
 
-    git show 21ff9fa^:handoffs/performance_17_thermal_energy.md (deleted, recover with git log --all --diff-filter=D -- handoffs/performance_17_thermal_energy.md)
+    git show 21ff9fa^:handoffs/performance_17_thermal_energy.md
 
 `bench/results/INSTRUCTION_AUDIT.md` section 10 reproduces the commands
 verbatim. The script is simply not an instrument and the protocol must stop
